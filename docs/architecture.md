@@ -72,6 +72,16 @@ unscored candidates and never infers consensus from a shared text prefix.
 The private atomic-file helper preserves the queue's previous write, fsync,
 rename and directory-sync behavior without depending on tool SDK utilities.
 
+Queue snapshots use compact JSON with the same version-1 fields. Readers accept
+both legacy indented snapshots and compact snapshots. This removes whitespace
+expansion under the queue lock; it does not change the full-snapshot complexity
+or replay ambiguous operations. `BenchmarkQueueSnapshotEncoding` compares both
+encodings at 100/1000 operations per task, and `BenchmarkQueuePersistLock`
+measures the actual atomic-save lock occupancy and output bytes for four tasks.
+Run these synthetic benchmarks with `go test ./autonomy -run '^$' -bench
+'BenchmarkQueue(SnapshotEncoding|PersistLock)' -benchtime=30x`. They are not
+production latency or task-quality measurements.
+
 ## Compatibility
 
 The tool SDK retains `autonomy`, `collab` and `task` forwarding packages with
