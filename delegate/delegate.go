@@ -302,6 +302,7 @@ type DelegateTask struct {
 	OwnerSource            string
 	RequestKey             string
 	AllowRecursiveDelegate bool
+	MaxChildren            int
 }
 
 // Owner identifies a parent session and its idempotent delegation request.
@@ -457,12 +458,21 @@ type DelegateManager struct {
 	sessionInitializer       func(*DelegateTask) error
 	taskStore                taskstore.Store
 	taskEvents               *taskstore.EventBus
+	executorSlots            chan struct{}
+	taskPlanner              collab.TaskPlannerFunc
+	resultVerifier           func(context.Context, *collab.SubTask, string) error
+	queueExecutor            AgentExecutorWithOptionsFunc
+	planner                  *collab.Planner
+	mdpPath                  string
 }
 
 // NewDelegateManager 创建子代理委派管理器
 func NewDelegateManager(cfg DelegateConfig, policies ...WorkspacePolicy) *DelegateManager {
+	cfg = normalizeDelegateConfig(cfg)
 	return &DelegateManager{
-		config:          normalizeDelegateConfig(cfg),
+		config:          cfg,
+		executorSlots:   make(chan struct{}, cfg.MaxConcurrent),
+		planner:         collab.NewPlanner(nil),
 		workspacePolicy: workspacePolicy(policies),
 		tasks:           make(map[string]*DelegateTask),
 		cancels:         make(map[string]context.CancelFunc),
@@ -515,15 +525,28 @@ func (dm *DelegateManager) Config() DelegateConfig {
 	return cfg
 }
 
-func (dm *DelegateManager) SetTaskStore(store taskstore.Store) {
+func (dm *DelegateManager) SetTaskStore(store taskstore.Store) error {
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
+	for _, t := range dm.tasks {
+		if t.Status == StatusRunning || t.Status == StatusPending {
+			return fmt.Errorf("cannot replace store during active delegation")
+		}
+	}
+	if store != nil {
+		restored, err := restoreDelegateTasks(store)
+		if err != nil {
+			return err
+		}
+		dm.tasks = restored
+	}
 	dm.taskStore = store
 	if store == nil {
 		dm.taskEvents = nil
-		return
+		return nil
 	}
 	dm.taskEvents = taskstore.NewEventBus(store)
+	return nil
 }
 
 // RecordExecutionMetrics attaches host Agent loop metrics to a delegated task.
@@ -754,7 +777,7 @@ func delegateModeArg(args map[string]any) (taskstore.Mode, error) {
 	}
 }
 
-func planDelegateTaskMode(description, contextStr string, requested taskstore.Mode, timeout time.Duration, maxChildren int) (taskstore.Mode, taskstore.Mode, string, any) {
+func planDelegateTaskMode(description, contextStr string, requested taskstore.Mode, timeout time.Duration, maxChildren int, planners ...*collab.Planner) (taskstore.Mode, taskstore.Mode, string, any) {
 	if requested == "" {
 		requested = taskstore.ModeSingle
 	}
@@ -782,6 +805,9 @@ func planDelegateTaskMode(description, contextStr string, requested taskstore.Mo
 	}
 
 	planner := collab.NewPlanner(nil)
+	if len(planners) > 0 && planners[0] != nil {
+		planner = planners[0]
+	}
 	allowed := []collab.CollabMode{collab.ModePipeline, collab.ModeParallel, collab.ModeDebate}
 	plan := planner.Plan(collab.PlanRequest{
 		Description:  description,
@@ -1003,12 +1029,15 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 	if maxChildren > delegateCfg.MaxChildren {
 		maxChildren = delegateCfg.MaxChildren
 	}
-	mode, plannedMode, plannerSummary, plannerTrace := planDelegateTaskMode(description, contextStr, requestedMode, timeout, maxChildren)
+	dm.mu.RLock()
+	planner := dm.planner
+	dm.mu.RUnlock()
+	mode, plannedMode, plannerSummary, plannerTrace := planDelegateTaskMode(description, contextStr, requestedMode, timeout, maxChildren, planner)
 	allowRecursive := delegateBoolArg(args, "allow_recursive_delegate", false) && delegateCfg.ChildAllowRecursive
 
 	// Reuse an existing task when the same request is dispatched more than
 	// once. This makes retries from a streaming provider idempotent.
-	dm.mu.RLock()
+	dm.mu.Lock()
 	running := 0
 	for _, t := range dm.tasks {
 		if owner.scoped() && owner.RequestKey != "" && t.OwnerSessionID == owner.SessionID && t.RequestKey == owner.RequestKey {
@@ -1025,21 +1054,19 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 				TimeoutSeconds:     int(timeout.Seconds()),
 				Message:            fmt.Sprintf("Task '%s' already exists for this request.", t.ID),
 			})
-			dm.mu.RUnlock()
+			dm.mu.Unlock()
 			return string(response), nil
 		}
-		if t.Status == StatusRunning {
+		if t.Status == StatusPending || t.Status == StatusRunning {
 			running++
 		}
 	}
-	dm.mu.RUnlock()
-
 	if running >= dm.config.MaxConcurrent {
+		dm.mu.Unlock()
 		return "", fmt.Errorf("max concurrent tasks reached (%d)", dm.config.MaxConcurrent)
 	}
 
 	// 创建任务
-	dm.mu.Lock()
 	dm.nextID++
 	// Keep task IDs unique across runtime restarts; the counter alone would
 	// recreate task-1 and could reuse its persisted execution session.
@@ -1067,6 +1094,7 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 		OwnerSource:            owner.Source,
 		RequestKey:             owner.RequestKey,
 		AllowRecursiveDelegate: allowRecursive,
+		MaxChildren:            maxChildren,
 	}
 	dm.tasks[taskID] = task
 	store := dm.taskStore
@@ -1128,6 +1156,7 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 	allowRecursive := task.AllowRecursiveDelegate && dm.config.ChildAllowRecursive
 	store := dm.taskStore
 	events := dm.taskEvents
+	executionTask := cloneDelegateTask(task)
 	dm.mu.Unlock()
 	dm.recordDelegateTaskStarted(store, events, task)
 	defer func() {
@@ -1141,12 +1170,16 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 	if executorWithOptions != nil || executor != nil {
 		var result string
 		var err error
-		if executorWithOptions != nil {
-			result, err = executorWithOptions(ctx, description, contextStr, AgentExecutorOptions{
-				AllowRecursiveDelegate: allowRecursive,
-			})
+		if executionTask.Mode != "" && executionTask.Mode != taskstore.ModeSingle {
+			result, err = dm.executeMode(ctx, executionTask, description, contextStr, timeout)
 		} else {
-			result, err = executor(ctx, description, contextStr)
+			result, err = dm.runChild(ctx, description, contextStr, AgentExecutorOptions{AllowRecursiveDelegate: allowRecursive})
+		}
+		if err == nil && ctx.Err() != nil {
+			err = ctx.Err()
+		}
+		if err == nil && strings.TrimSpace(result) == "" {
+			err = fmt.Errorf("delegate returned empty result")
 		}
 		dm.mu.Lock()
 		if task.Status == StatusCancelled {
@@ -1154,6 +1187,7 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 		} else if err != nil {
 			task.Status = StatusFailed
 			task.Error = err.Error()
+			task.Result = result
 		} else {
 			task.Status = StatusCompleted
 			task.Result = result
@@ -1185,8 +1219,8 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 
 	dm.mu.Lock()
 	if task.Status != StatusCancelled {
-		task.Status = StatusCompleted
-		task.Result = fmt.Sprintf("Sub-agent task completed (no executor): %s", description)
+		task.Status = StatusFailed
+		task.Error = "no agent executor configured"
 		task.CompletedAt = time.Now()
 	}
 	snapshot := cloneDelegateTask(task)
@@ -1992,17 +2026,7 @@ func (dm *DelegateManager) DelegateParallel(descriptions []string, contextStr st
 			if workspaceErr != nil {
 				err = workspaceErr
 			} else {
-				dm.mu.RLock()
-				executor := dm.agentExecutor
-				executorWithOptions := dm.agentExecutorWithOptions
-				dm.mu.RUnlock()
-				if executorWithOptions != nil {
-					result, err = executorWithOptions(ctx, description, enrichedContext, AgentExecutorOptions{})
-				} else if executor != nil {
-					result, err = executor(ctx, description, enrichedContext)
-				} else {
-					result = fmt.Sprintf("Sub-agent task completed (no executor): %s", description)
-				}
+				result, err = dm.runChild(ctx, description, enrichedContext, AgentExecutorOptions{})
 			}
 
 			// 更新任务状态

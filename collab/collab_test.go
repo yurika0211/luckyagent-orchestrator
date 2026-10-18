@@ -2,6 +2,7 @@ package collab
 
 import (
 	"context"
+	"fmt"
 	"path/filepath"
 	"strings"
 	"sync/atomic"
@@ -10,6 +11,16 @@ import (
 
 	taskstore "github.com/yurika0211/luckyagent-orchestrator/task"
 )
+
+// Successful verification is explicit in fixtures that exercise verified modes.
+type acceptingTestHandler struct{ TaskHandler }
+
+func (h acceptingTestHandler) VerifySubTask(_ context.Context, _ *SubTask, output string) error {
+	if strings.TrimSpace(output) == "" {
+		return fmt.Errorf("empty output")
+	}
+	return nil
+}
 
 func TestMessageEncodeDecode(t *testing.T) {
 	msg := NewMessage(MsgTaskAssign, "agent-1", "agent-2", map[string]any{
@@ -243,7 +254,7 @@ func TestDelegateManagerPipeline(t *testing.T) {
 		return task.Input + "->processed_by_" + task.AgentID, nil
 	})
 
-	dm := NewDelegateManager(r, handler)
+	dm := NewDelegateManager(r, acceptingTestHandler{handler})
 
 	task, err := dm.Delegate(context.Background(), ModePipeline, "test pipeline", "input", []string{"agent-1", "agent-2"}, 10*time.Second)
 	if err != nil {
@@ -271,9 +282,8 @@ func TestDelegateManagerPipeline(t *testing.T) {
 	}
 
 	// Pipeline: input -> agent-1 -> agent-2
-	expected := "input->processed_by_agent-1->processed_by_agent-2"
-	if updated.Result != expected {
-		t.Errorf("result: got %s, want %s", updated.Result, expected)
+	if !strings.Contains(updated.Result, "Original task: test pipeline") || !strings.Contains(updated.Result, "input->processed_by_agent-1->processed_by_agent-2") {
+		t.Errorf("pipeline lost original request or stage output: %s", updated.Result)
 	}
 }
 
@@ -488,7 +498,7 @@ func TestDelegateManagerParallel(t *testing.T) {
 		return "result_from_" + task.AgentID, nil
 	})
 
-	dm := NewDelegateManager(r, handler)
+	dm := NewDelegateManager(r, acceptingTestHandler{handler})
 
 	task, err := dm.Delegate(context.Background(), ModeParallel, "test parallel", "input", []string{"agent-1", "agent-2", "agent-3"}, 10*time.Second)
 	if err != nil {
@@ -525,7 +535,7 @@ func TestDelegateManagerParallelRetryPolicyRetriesFailedSubTask(t *testing.T) {
 		}
 		return "result_from_" + task.AgentID, nil
 	})
-	dm := NewDelegateManager(r, handler)
+	dm := NewDelegateManager(r, acceptingTestHandler{handler})
 
 	task, err := dm.Delegate(context.Background(), ModeParallel, "并行比较删除 verifier 风险", "input", []string{"agent-1", "agent-2"}, 10*time.Second)
 	if err != nil {
@@ -567,7 +577,7 @@ func TestDelegateManagerVerifierRejectsEmptyOutput(t *testing.T) {
 	if updated.State != TaskFailed {
 		t.Fatalf("task state: got %s, want failed; result=%s", updated.State, updated.Result)
 	}
-	if len(updated.SubTasks) == 0 || !strings.Contains(updated.SubTasks[0].Error, "verifier rejected") {
+	if len(updated.SubTasks) == 0 || !strings.Contains(updated.SubTasks[0].Error, "empty output") {
 		t.Fatalf("expected verification error, subtasks=%+v", updated.SubTasks)
 	}
 }
@@ -650,9 +660,8 @@ func TestAggregatorBest(t *testing.T) {
 	if agg.Strategy != AggBest {
 		t.Errorf("strategy: got %s, want best", agg.Strategy)
 	}
-	// 最长的应该是最佳
-	if agg.BestIndex != 2 {
-		t.Errorf("best index: got %d, want 2", agg.BestIndex)
+	if agg.BestIndex != -1 || agg.Metadata["selection"] != "unscored" || !strings.Contains(agg.Output, results[0]) || !strings.Contains(agg.Output, results[2]) {
+		t.Errorf("unscored candidates must be preserved: %+v", agg)
 	}
 }
 

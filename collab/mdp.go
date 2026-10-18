@@ -9,6 +9,8 @@ import (
 	"strings"
 	"sync"
 	"time"
+
+	"github.com/yurika0211/luckyagent-orchestrator/internal/fileutil"
 )
 
 const mdpPlannerVersion = "mdp-q-v1"
@@ -299,7 +301,7 @@ func (m *MDPModel) SaveJSON(path string) error {
 	if err != nil {
 		return fmt.Errorf("encode mdp snapshot: %w", err)
 	}
-	return os.WriteFile(path, data, 0o600)
+	return fileutil.WriteFileAtomic(path, data, 0o600)
 }
 
 // LoadMDPModelJSON loads a model snapshot from disk.

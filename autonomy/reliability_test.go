@@ -266,6 +266,37 @@ func TestRecoveryStopCancelsAndRetainsTask(t *testing.T) {
 	}
 }
 
+func TestCancelQueuedDelegateInvalidatesClaimBeforeLateCompletion(t *testing.T) {
+	q := NewTaskQueue(4)
+	started := make(chan struct{})
+	executor := &reliabilityExecutor{run: func(ctx context.Context, _ string, cfg LoopConfig) (*LoopResult, error) {
+		close(started)
+		<-ctx.Done()
+		// Simulate an executor returning a late successful result after cancellation.
+		return &LoopResult{Response: "late result", Verified: true}, nil
+	}}
+	pool := NewWorkerPool(DefaultPoolConfig(), executor, q)
+	task := q.Add("delegated task", "", PriorityNormal, nil)
+	if err := pool.Start(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	select {
+	case <-started:
+	case <-time.After(2 * time.Second):
+		t.Fatal("worker did not start")
+	}
+	if err := pool.CancelTask(task.ID, "parent cancelled"); err != nil {
+		t.Fatal(err)
+	}
+	if err := pool.Stop(); err != nil {
+		t.Fatal(err)
+	}
+	got, _ := q.Get(task.ID)
+	if got.State != TaskBlocked || got.BlockReason != "parent cancelled" || got.Verified {
+		t.Fatalf("late completion resurrected cancelled task: %+v", got)
+	}
+}
+
 func TestRecoveryDoesNotCompleteUnverifiedResult(t *testing.T) {
 	q := NewTaskQueue(4)
 	task := q.Add("verify", "", PriorityNormal, nil)

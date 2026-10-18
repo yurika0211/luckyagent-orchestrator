@@ -218,7 +218,9 @@ func TestDelegateManagerAutoModeUsesPlanner(t *testing.T) {
 		t.Fatalf("delegate: %v", err)
 	}
 
-	time.Sleep(100 * time.Millisecond)
+	if _, err := dm.Wait(context.Background(), task.ID); err != nil {
+		t.Fatal(err)
+	}
 	updated, ok := dm.GetTask(task.ID)
 	if !ok {
 		t.Fatal("task not found")

@@ -43,24 +43,21 @@ type ScorerFunc func(result string) float64
 
 // NewAggregator 创建聚合器
 func NewAggregator() *Aggregator {
-	a := &Aggregator{
+	return &Aggregator{
 		scorers: make(map[AggregationStrategy]ScorerFunc),
 	}
+}
 
-	// 默认评分器：按长度评分（越长越详细，分数越高，上限 1.0）
-	a.scorers[AggBest] = func(result string) float64 {
-		length := len(result)
-		if length == 0 {
-			return 0
-		}
-		// 500 字以上满分
-		if length >= 500 {
-			return 1.0
-		}
-		return float64(length) / 500.0
+// SetScorer installs a caller's quality evaluator. Without one, best preserves
+// all candidates rather than pretending output length measures correctness.
+func (a *Aggregator) SetScorer(strategy AggregationStrategy, scorer ScorerFunc) {
+	a.mu.Lock()
+	defer a.mu.Unlock()
+	if scorer == nil {
+		delete(a.scorers, strategy)
+	} else {
+		a.scorers[strategy] = scorer
 	}
-
-	return a
 }
 
 // Aggregate 聚合子任务结果
@@ -76,7 +73,7 @@ func (a *Aggregator) Aggregate(strategy AggregationStrategy, results []string) *
 	// 过滤空结果
 	nonEmpty := make([]string, 0, len(results))
 	for _, r := range results {
-		if r != "" {
+		if strings.TrimSpace(r) != "" {
 			nonEmpty = append(nonEmpty, r)
 		}
 	}
@@ -121,8 +118,8 @@ func (a *Aggregator) aggregateBest(results []string) *AggregationResult {
 	a.mu.RUnlock()
 
 	if !ok {
-		// 降级到拼接
-		return a.aggregateConcat(results)
+		return &AggregationResult{Strategy: AggBest, Output: strings.Join(results, "\n\n---\n\n"), Count: len(results), BestIndex: -1,
+			Metadata: map[string]string{"selection": "unscored", "reason": "quality evaluator not configured"}}
 	}
 
 	bestIdx := 0
@@ -147,22 +144,20 @@ func (a *Aggregator) aggregateBest(results []string) *AggregationResult {
 	}
 }
 
-// aggregateVote 投票 — 按结果相似度分组，最多票的胜出
+// aggregateVote counts complete answers; shared prefixes are not consensus.
 func (a *Aggregator) aggregateVote(results []string) *AggregationResult {
-	// 简化投票：按结果前 100 字符分组
-	groups := make(map[string][]int) // prefix -> indices
+	groups := make(map[string][]int)
 	for i, r := range results {
-		prefix := r
-		if len(prefix) > 100 {
-			prefix = prefix[:100]
-		}
+		prefix := strings.TrimSpace(r)
 		groups[prefix] = append(groups[prefix], i)
 	}
 
 	// 找最大组
 	bestPrefix := ""
 	bestCount := 0
-	for prefix, indices := range groups {
+	for _, r := range results {
+		prefix := strings.TrimSpace(r)
+		indices := groups[prefix]
 		if len(indices) > bestCount {
 			bestCount = len(indices)
 			bestPrefix = prefix
@@ -177,8 +172,14 @@ func (a *Aggregator) aggregateVote(results []string) *AggregationResult {
 
 	// 使用最大组的第一个结果
 	output := ""
+	metadata := map[string]string{"comparison": "complete_answer", "consensus": "false"}
 	if indices, ok := groups[bestPrefix]; ok && len(indices) > 0 {
 		output = results[indices[0]]
+	}
+	if bestCount*2 > len(results) {
+		metadata["consensus"] = "true"
+	} else {
+		output = strings.Join(results, "\n\n---\n\n")
 	}
 
 	return &AggregationResult{
@@ -186,6 +187,7 @@ func (a *Aggregator) aggregateVote(results []string) *AggregationResult {
 		Output:   output,
 		Count:    len(results),
 		Votes:    votes,
+		Metadata: metadata,
 	}
 }
 
@@ -238,8 +240,9 @@ func (a *Aggregator) aggregateSummary(results []string) *AggregationResult {
 	var parts []string
 	for i, r := range results {
 		summary := r
-		if len(summary) > maxPerResult {
-			summary = summary[:maxPerResult] + "..."
+		chars := []rune(r)
+		if len(chars) > maxPerResult {
+			summary = string(chars[:maxPerResult]) + "..."
 		}
 		parts = append(parts, fmt.Sprintf("[Agent %d] %s", i+1, summary))
 	}

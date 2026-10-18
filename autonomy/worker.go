@@ -350,13 +350,14 @@ type WorkerPool struct {
 	executor AgentExecutor
 	queue    *TaskQueue
 
-	mu       sync.RWMutex
-	workers  map[string]*Worker
-	nextID   atomic.Int64
-	running  atomic.Bool
-	stopCh   chan struct{}
-	wg       sync.WaitGroup
-	stopping bool
+	mu          sync.RWMutex
+	workers     map[string]*Worker
+	nextID      atomic.Int64
+	running     atomic.Bool
+	stopCh      chan struct{}
+	wg          sync.WaitGroup
+	stopping    bool
+	taskCancels map[string]context.CancelFunc
 
 	// Results channel — non-blocking, consumers drain at their pace
 	results chan *WorkerResult
@@ -391,12 +392,13 @@ func NewWorkerPool(cfg PoolConfig, executor AgentExecutor, queue *TaskQueue) *Wo
 	cfg.RunPolicy = normalizeRunPolicy(cfg.RunPolicy)
 	queue.policy = cfg.RunPolicy
 	return &WorkerPool{
-		config:   cfg,
-		executor: executor,
-		queue:    queue,
-		workers:  make(map[string]*Worker),
-		stopCh:   make(chan struct{}),
-		results:  make(chan *WorkerResult, cfg.QueueBuffer),
+		config:      cfg,
+		executor:    executor,
+		queue:       queue,
+		workers:     make(map[string]*Worker),
+		stopCh:      make(chan struct{}),
+		results:     make(chan *WorkerResult, cfg.QueueBuffer),
+		taskCancels: make(map[string]context.CancelFunc),
 	}
 }
 
@@ -591,9 +593,14 @@ func (p *WorkerPool) executeTask(ctx context.Context, w *Worker, task *QueueTask
 	}
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	p.mu.RLock()
+	p.mu.Lock()
+	p.taskCancels[task.ID] = cancel
 	stopCh := p.stopCh
-	p.mu.RUnlock()
+	p.mu.Unlock()
+	defer func() { p.mu.Lock(); delete(p.taskCancels, task.ID); p.mu.Unlock() }()
+	if current, ok := p.queue.Get(task.ID); !ok || current.State != TaskInProgress || current.Attempts != task.Attempts {
+		return
+	}
 	go func() {
 		select {
 		case <-stopCh:
@@ -629,6 +636,30 @@ func (p *WorkerPool) executeTask(ctx context.Context, w *Worker, task *QueueTask
 	default:
 		// consumer not ready, drop (task result is already in queue)
 	}
+}
+
+// CancelTask blocks a queued/claimed task durably before cancelling its worker.
+// A late completion cannot resurrect the task because its claim is invalidated.
+func (p *WorkerPool) CancelTask(taskID, reason string) error {
+	p.queue.mu.Lock()
+	err := p.queue.updateLocked(taskID, func(task *QueueTask) error {
+		if task.State == TaskDone {
+			return nil
+		}
+		task.State, task.BlockReason, task.AssignedTo = TaskBlocked, reason, ""
+		return nil
+	})
+	p.queue.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	p.mu.RLock()
+	cancel := p.taskCancels[taskID]
+	p.mu.RUnlock()
+	if cancel != nil {
+		cancel()
+	}
+	return nil
 }
 
 // findIdleWorker finds an idle worker in the pool.

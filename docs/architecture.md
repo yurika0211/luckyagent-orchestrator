@@ -35,10 +35,19 @@ host-owned.
 queued work in addition to checking blocked tasks. `passive` does not disable
 the worker pool's separate dispatcher.
 
-The previous delegation semantics are preserved: `subagent mode=autonomy_queue`
-is accepted as recorded planning metadata and is not wired to the autonomy
-queue. The normal delegate executor also does not switch into `collab` based
-on its recorded mode. Connecting those paths is a separate functional change.
+Ordinary delegation dispatches `parallel`, `pipeline` and `debate` through
+`collab`, with distinct execution sessions and an injected semantic assignment
+planner. `autonomy_queue` calls an injected durable-queue adapter and fails if
+none is configured. The application owns that queue and its worker lifecycle.
+Pending/running admission is atomic and idempotent; adapters share execution
+slots through `WithExecutionSlot`.
+
+Assignments include explicit responsibilities and acceptance criteria. Required
+verification fails closed without a verifier and finishes before durable child
+completion. Failed assignments make the parent fail while retaining useful
+partial results; retries include prior feedback. Ballots preserve positions,
+reject unknown agents and require a strict majority. Aggregation preserves
+unscored candidates and never infers consensus from a shared text prefix.
 
 ## Durable state and foreground use
 
@@ -47,6 +56,12 @@ on its recorded mode. Connecting those paths is a separate functional change.
   checkpoints, operation records, acceptance criteria, retries and budgets.
 - These are separate models. Repository extraction does not merge their
   state machines or replace one store with the other.
+- Startup `SetTaskStore` restores direct delegate/collaboration history and
+  marks interrupted direct work failed, preserving task/session links. It
+  returns recovery errors and must run before serving requests. It never
+  replays side effects. Private new-run managers use `AttachTaskStore` without
+  reconciling another manager's active tasks. `Wait` includes persistence and
+  planner feedback; direct task history is separate from queue recovery.
 - LuckyAgent also uses `autonomy.TaskQueue`/`Execution` for foreground durable
   turns. Its foreground files are separate from the background queue and are
   driven directly by the foreground loop. Background workers must not poll
