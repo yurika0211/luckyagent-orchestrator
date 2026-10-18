@@ -3,6 +3,7 @@ package collab
 import (
 	"context"
 	"fmt"
+	"slices"
 	"sync"
 	"time"
 )
@@ -90,7 +91,7 @@ func (r *Registry) Register(profile *AgentProfile) error {
 		profile.Runtime.AgentID = profile.ID
 	}
 
-	r.agents[profile.ID] = profile
+	r.agents[profile.ID] = cloneAgentProfile(profile)
 
 	// 触发钩子
 	for _, hook := range r.hooks {
@@ -287,7 +288,7 @@ func cloneAgentProfile(p *AgentProfile) *AgentProfile {
 	}
 	cp := *p
 	cp.Capabilities = append([]string(nil), p.Capabilities...)
-	cp.Runtime.ToolAllowlist = append([]string(nil), p.Runtime.ToolAllowlist...)
+	cp.Runtime.ToolAllowlist = slices.Clone(p.Runtime.ToolAllowlist)
 	if len(p.Metadata) > 0 {
 		cp.Metadata = make(map[string]string, len(p.Metadata))
 		for k, v := range p.Metadata {

@@ -172,6 +172,10 @@ func (c *TaskCache) Clean() int {
 // The skill's tools will be invoked to complete the task.
 func (dm *DelegateManager) DelegateToSkill(ctx context.Context, skillName, description string, priority TaskPriority) (*DelegateTask, error) {
 	dm.mu.Lock()
+	if err := dm.checkAdmissionLocked(); err != nil {
+		dm.mu.Unlock()
+		return nil, err
+	}
 	dm.nextID++
 	taskID := fmt.Sprintf("skill-%d", dm.nextID)
 	task := &DelegateTask{
@@ -193,17 +197,22 @@ func (dm *DelegateManager) DelegateToSkill(ctx context.Context, skillName, descr
 		"message":    fmt.Sprintf("Task delegated to skill '%s'. Use task_status to check progress.", skillName),
 	})
 	task.Result = string(result)
+	snapshot := cloneDelegateTask(task)
 	dm.mu.Unlock()
 
 	// Execute asynchronously
 	go dm.executeSkillTask(ctx, taskID, skillName, description)
 
-	return task, nil
+	return &snapshot, nil
 }
 
 // DelegateToMCP delegates a task to an MCP server.
 func (dm *DelegateManager) DelegateToMCP(ctx context.Context, serverName, toolName string, args map[string]any, priority TaskPriority) (*DelegateTask, error) {
 	dm.mu.Lock()
+	if err := dm.checkAdmissionLocked(); err != nil {
+		dm.mu.Unlock()
+		return nil, err
+	}
 	dm.nextID++
 	taskID := fmt.Sprintf("mcp-%d", dm.nextID)
 	task := &DelegateTask{
@@ -226,12 +235,13 @@ func (dm *DelegateManager) DelegateToMCP(ctx context.Context, serverName, toolNa
 		"message":     fmt.Sprintf("Task delegated to MCP server '%s'. Use task_status to check progress.", serverName),
 	})
 	task.Result = string(result)
+	snapshot := cloneDelegateTask(task)
 	dm.mu.Unlock()
 
 	// Execute asynchronously
 	go dm.executeMCPTask(ctx, taskID, serverName, toolName, args)
 
-	return task, nil
+	return &snapshot, nil
 }
 
 // executeSkillTask executes a task by delegating to a skill.
@@ -241,39 +251,22 @@ func (dm *DelegateManager) executeSkillTask(ctx context.Context, taskID, skillNa
 	task.Status = StatusRunning
 	dm.mu.Unlock()
 
-	timeout := dm.config.Timeout
-	if deadline, ok := ctx.Deadline(); ok {
-		if remaining := time.Until(deadline); remaining < timeout {
-			timeout = remaining
-		}
+	ctx, cancel := context.WithTimeout(ctx, dm.config.Timeout)
+	defer cancel()
+	result, err := dm.runChild(ctx, description, fmt.Sprintf("Use the installed skill %q for the assigned task. Report missing skills or unfinished work explicitly.", skillName), AgentExecutorOptions{})
+	if err == nil {
+		err = ctx.Err()
 	}
-
-	done := make(chan struct{})
-	go func() {
-		defer close(done)
-		// v0.5.0: Simplified — real implementation would invoke skill tools
-		dm.mu.Lock()
-		task.Status = StatusCompleted
-		task.Result = fmt.Sprintf("Skill '%s' completed task: %s", skillName, description)
-		task.CompletedAt = time.Now()
-		dm.mu.Unlock()
-	}()
-
-	select {
-	case <-done:
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	task.CompletedAt = time.Now()
+	if task.Status == StatusCancelled {
 		return
-	case <-time.After(timeout):
-		dm.mu.Lock()
-		task.Status = StatusFailed
-		task.Error = "timeout"
-		task.CompletedAt = time.Now()
-		dm.mu.Unlock()
-	case <-ctx.Done():
-		dm.mu.Lock()
-		task.Status = StatusCancelled
-		task.Error = "context cancelled"
-		task.CompletedAt = time.Now()
-		dm.mu.Unlock()
+	}
+	if err != nil {
+		task.Status, task.Error = StatusFailed, err.Error()
+	} else {
+		task.Status, task.Result = StatusCompleted, result
 	}
 }
 
@@ -292,11 +285,17 @@ func (dm *DelegateManager) executeMCPTask(ctx context.Context, taskID, serverNam
 	if executor == nil {
 		err = fmt.Errorf("MCP executor is not configured")
 	} else {
-		result, err = executor(ctx, serverName, toolName, args)
+		result, err = dm.WithExecutionSlot(ctx, func() (string, error) { return executor(ctx, serverName, toolName, args) })
+	}
+	if err == nil {
+		err = ctx.Err()
 	}
 	dm.mu.Lock()
 	defer dm.mu.Unlock()
 	task.CompletedAt = time.Now()
+	if task.Status == StatusCancelled {
+		return
+	}
 	if err != nil {
 		task.Status = StatusFailed
 		task.Error = err.Error()

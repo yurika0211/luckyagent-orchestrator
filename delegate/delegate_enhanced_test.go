@@ -2,6 +2,8 @@ package delegate
 
 import (
 	"context"
+	"fmt"
+	"strings"
 	"testing"
 	"time"
 )
@@ -68,6 +70,12 @@ func TestDelegateTargetString(t *testing.T) {
 
 func TestDelegateToSkill(t *testing.T) {
 	dm := NewDelegateManager(DefaultDelegateConfig())
+	dm.SetAgentExecutor(func(_ context.Context, description, input string) (string, error) {
+		if !strings.Contains(input, "web-search") {
+			return "", fmt.Errorf("missing assigned skill")
+		}
+		return "tutorial evidence", nil
+	})
 
 	task, err := dm.DelegateToSkill(context.Background(), "web-search", "Search for Go tutorials", PriorityNormal)
 	if err != nil {
@@ -122,7 +130,12 @@ func TestDelegateToMCP(t *testing.T) {
 	var completedTask *DelegateTask
 	for time.Now().Before(deadline) {
 		dm.mu.RLock()
-		found, ok := dm.tasks[task.ID]
+		live, ok := dm.tasks[task.ID]
+		var snapshot DelegateTask
+		if ok {
+			snapshot = cloneDelegateTask(live)
+		}
+		found := &snapshot
 		dm.mu.RUnlock()
 		if ok && (found.Status == StatusCompleted || found.Status == StatusFailed || found.Status == StatusCancelled) {
 			completedTask = found
@@ -147,7 +160,11 @@ func TestDelegateToMCPWithoutExecutorFails(t *testing.T) {
 	deadline := time.Now().Add(2 * time.Second)
 	for time.Now().Before(deadline) {
 		dm.mu.RLock()
-		found := dm.tasks[task.ID]
+		var found *DelegateTask
+		if live := dm.tasks[task.ID]; live != nil {
+			snapshot := cloneDelegateTask(live)
+			found = &snapshot
+		}
 		dm.mu.RUnlock()
 		if found != nil && found.Status == StatusFailed {
 			if found.Error == "" {
