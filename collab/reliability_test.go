@@ -144,3 +144,30 @@ func TestPlannerRejectsDuplicateResponsibilities(t *testing.T) {
 		t.Fatal("duplicated work was accepted as a plan")
 	}
 }
+
+func TestPlannerAssignmentsPreserveOriginalConstraints(t *testing.T) {
+	r := NewRegistry()
+	_ = r.Register(&AgentProfile{ID: "one"})
+	_ = r.Register(&AgentProfile{ID: "two"})
+	inputs := make(chan string, 2)
+	dm := NewDelegateManager(r, acceptingTestHandler{TaskHandlerFunc(func(_ context.Context, sub *SubTask) (string, error) {
+		inputs <- sub.Input
+		return "inspection evidence", nil
+	})})
+	dm.SetTaskPlanner(func(context.Context, CollabMode, string, string, []*AgentProfile) ([]Assignment, error) {
+		return []Assignment{{AgentID: "one", Description: "Inspect API", AcceptanceCriteria: []string{"report evidence"}}, {AgentID: "two", Description: "Inspect tools", AcceptanceCriteria: []string{"report evidence"}}}, nil
+	})
+	job, err := dm.Delegate(context.Background(), ModeParallel, "Inspect only; do not edit or deploy", "current request context", []string{"one", "two"}, time.Second)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := dm.Wait(context.Background(), job.ID); err != nil {
+		t.Fatal(err)
+	}
+	for range 2 {
+		input := <-inputs
+		if !strings.Contains(input, "Inspect only; do not edit or deploy") || !strings.Contains(input, "current request context") {
+			t.Fatalf("assignment erased original constraints: %s", input)
+		}
+	}
+}

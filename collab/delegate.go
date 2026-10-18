@@ -365,6 +365,10 @@ func (dm *DelegateManager) delegate(ctx context.Context, mode CollabMode, descri
 	if err := assignSubTasks(subTasks, assignments); err != nil {
 		return nil, err
 	}
+	for _, sub := range subTasks {
+		// A decomposed responsibility must not erase the user's original limits.
+		sub.Input = fmt.Sprintf("Original task:\n%s\n\nOriginal input:\n%s", description, input)
+	}
 
 	task := &CollabTask{
 		ID:                 taskID,
