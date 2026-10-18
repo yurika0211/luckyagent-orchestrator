@@ -1,0 +1,504 @@
+package autonomy
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"sort"
+	"strconv"
+	"strings"
+	"time"
+)
+
+// ---------------------------------------------------------------------------
+// Built-in Tools for Agent Loop integration
+// ---------------------------------------------------------------------------
+
+// ToolDefinitions returns the tool definitions for autonomy tools.
+// These are registered with the agent's tool registry so the LLM
+// can call them directly during a RunLoop.
+type ToolDefinitions struct {
+	kit *AutonomyKit
+}
+
+// NewToolDefinitions creates tool definitions bound to an autonomy kit.
+func NewToolDefinitions(kit *AutonomyKit) *ToolDefinitions {
+	return &ToolDefinitions{kit: kit}
+}
+
+// AutonomyQueueAdd adds a task to the autonomy task queue.
+// Tool: autonomy_queue_add
+func (td *ToolDefinitions) HandleQueueAdd(args map[string]any) (string, error) {
+	title, _ := args["title"].(string)
+	if title == "" {
+		return "", fmt.Errorf("title is required")
+	}
+
+	description, _ := args["description"].(string)
+
+	priorityStr := "normal"
+	if p, ok := args["priority"].(string); ok {
+		priorityStr = p
+	}
+	priority := ParseTaskPriority(priorityStr)
+
+	var tags []string
+	if t, ok := args["tags"].([]any); ok {
+		for _, tag := range t {
+			if s, ok := tag.(string); ok {
+				tags = append(tags, s)
+			}
+		}
+	} else if t, ok := args["tags"].([]string); ok {
+		tags = append(tags, t...)
+	}
+
+	metadata := map[string]string{}
+	if sessionID, _ := args["_parent_session_id"].(string); strings.TrimSpace(sessionID) != "" {
+		metadata["parent_session_id"] = strings.TrimSpace(sessionID)
+	}
+	if key, _ := args["idempotency_key"].(string); strings.TrimSpace(key) != "" {
+		metadata["idempotency_key"] = strings.TrimSpace(key)
+	}
+	criteria, err := ParseAcceptanceCriteria(args["acceptance_criteria"])
+	if err != nil {
+		return "", err
+	}
+	task, deduped, err := td.kit.Queue().AddWithAcceptance(title, description, priority, tags, metadata, criteria)
+	if err != nil {
+		return "", err
+	}
+	ready, inProgress, blocked, done := td.kit.Queue().Stats()
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":                   true,
+		"action":               "add",
+		"task_id":              task.ID,
+		"execution_session_id": task.SessionID,
+		"parent_session_id":    task.Metadata["parent_session_id"],
+		"role":                 "worker-task",
+		"title":                task.Title,
+		"priority":             task.Priority.String(),
+		"state":                task.State,
+		"tags":                 task.Tags,
+		"metadata":             task.Metadata,
+		"deduped":              deduped,
+		"acceptance_criteria":  task.AcceptanceCriteria,
+		"queue_ready":          ready,
+		"queue_in_progress":    inProgress,
+		"queue_blocked":        blocked,
+		"queue_done":           done,
+		"worker_count":         safeWorkerCount(td.kit),
+		"message":              fmt.Sprintf("Task '%s' added to queue with %s priority", title, priority),
+	})
+
+	return string(result), nil
+}
+
+// HandleQueueList lists tasks in the queue.
+// Tool: autonomy_queue_list
+func (td *ToolDefinitions) HandleQueueList(args map[string]any) (string, error) {
+	stateFilter, _ := args["state"].(string)
+
+	var tasks []*QueueTask
+	if stateFilter != "" {
+		tasks = td.kit.Queue().ListByState(TaskState(stateFilter))
+	} else {
+		tasks = td.kit.Queue().ListAll()
+	}
+
+	// Summarize for LLM consumption
+	ready, inProgress, blocked, done := td.kit.Queue().Stats()
+
+	var items []map[string]any
+	for _, t := range tasks {
+		item := map[string]any{
+			"id":                    t.ID,
+			"title":                 t.Title,
+			"priority":              t.Priority.String(),
+			"state":                 t.State,
+			"assigned_to":           t.AssignedTo,
+			"tags":                  t.Tags,
+			"session_id":            t.SessionID,
+			"execution_session_id":  t.SessionID,
+			"parent_session_id":     t.Metadata["parent_session_id"],
+			"role":                  "worker-task",
+			"attempts":              t.Attempts,
+			"retries":               t.Retries,
+			"continuations":         t.Continuations,
+			"next_run_at":           t.NextRunAt,
+			"checkpoint_at":         t.CheckpointAt,
+			"verified":              t.Verified,
+			"verification":          t.Verification,
+			"acceptance_criteria":   t.AcceptanceCriteria,
+			"unresolved_operations": unresolvedOperations(t),
+		}
+		if t.Result != "" {
+			item["result_preview"] = truncateToolText(t.Result, 1200)
+		}
+		if t.Error != "" {
+			item["error"] = truncateToolText(t.Error, 1200)
+		}
+		if t.BlockReason != "" {
+			item["block_reason"] = truncateToolText(t.BlockReason, 1200)
+		}
+		if !t.CreatedAt.IsZero() {
+			item["created_at"] = t.CreatedAt
+		}
+		if !t.StartedAt.IsZero() {
+			item["started_at"] = t.StartedAt
+		}
+		if !t.CompletedAt.IsZero() {
+			item["completed_at"] = t.CompletedAt
+		}
+		items = append(items, item)
+	}
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":           true,
+		"action":       "list",
+		"state_filter": stateFilter,
+		"tasks":        items,
+		"total":        len(items),
+		"ready":        ready,
+		"in_progress":  inProgress,
+		"blocked":      blocked,
+		"done":         done,
+	})
+
+	return string(result), nil
+}
+
+// HandleReport returns recent autonomy task outputs for user-facing summaries.
+func (td *ToolDefinitions) HandleReport(args map[string]any) (string, error) {
+	state := TaskDone
+	if raw, _ := args["state"].(string); strings.TrimSpace(raw) != "" {
+		state = TaskState(strings.TrimSpace(raw))
+	}
+	limit := parseToolLimit(args, 5, 20)
+
+	tasks := td.kit.Queue().ListByState(state)
+	total := len(tasks)
+	sort.SliceStable(tasks, func(i, j int) bool {
+		return taskReportTime(tasks[i]).After(taskReportTime(tasks[j]))
+	})
+	if len(tasks) > limit {
+		tasks = tasks[:limit]
+	}
+
+	items := make([]map[string]any, 0, len(tasks))
+	for _, t := range tasks {
+		item := map[string]any{
+			"id":                    t.ID,
+			"title":                 t.Title,
+			"description":           t.Description,
+			"priority":              t.Priority.String(),
+			"state":                 t.State,
+			"assigned_to":           t.AssignedTo,
+			"tags":                  t.Tags,
+			"created_at":            t.CreatedAt,
+			"verified":              t.Verified,
+			"verification":          t.Verification,
+			"attempts":              t.Attempts,
+			"retries":               t.Retries,
+			"continuations":         t.Continuations,
+			"checkpoint_at":         t.CheckpointAt,
+			"unresolved_operations": unresolvedOperations(t),
+		}
+		if !t.StartedAt.IsZero() {
+			item["started_at"] = t.StartedAt
+		}
+		if !t.CompletedAt.IsZero() {
+			item["completed_at"] = t.CompletedAt
+		}
+		if t.Result != "" {
+			item["result"] = truncateToolText(t.Result, 4000)
+		}
+		if t.Error != "" {
+			item["error"] = truncateToolText(t.Error, 4000)
+		}
+		if t.BlockReason != "" {
+			item["block_reason"] = truncateToolText(t.BlockReason, 4000)
+		}
+		items = append(items, item)
+	}
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":       true,
+		"action":   "report",
+		"state":    state,
+		"total":    total,
+		"returned": len(items),
+		"tasks":    items,
+	})
+	return string(result), nil
+}
+
+// HandleQueueUpdate updates a task's state.
+// Tool: autonomy_queue_update
+func (td *ToolDefinitions) HandleQueueUpdate(args map[string]any) (string, error) {
+	taskID, _ := args["task_id"].(string)
+	if taskID == "" {
+		return "", fmt.Errorf("task_id is required")
+	}
+
+	action, _ := args["action"].(string)
+	if action == "" {
+		return "", fmt.Errorf("action is required (complete, fail, block, unblock, resolve)")
+	}
+
+	var err error
+	var msg string
+
+	switch action {
+	case "resolve":
+		operationID, _ := args["operation_id"].(string)
+		resolution, _ := args["resolution"].(string)
+		output, _ := args["result"].(string)
+		err = td.kit.Queue().ResolveOperation(taskID, operationID, resolution, output)
+		msg = "Operation reconciled; use unblock after checking all unresolved operations"
+	case "complete":
+		result, _ := args["result"].(string)
+		err = td.kit.Queue().Complete(taskID, result)
+		msg = fmt.Sprintf("Task %s completed", taskID)
+	case "fail":
+		errMsg, _ := args["error"].(string)
+		retry := true
+		if r, ok := args["retry"].(bool); ok {
+			retry = r
+		}
+		err = td.kit.Queue().Fail(taskID, errMsg, retry)
+		if retry {
+			msg = fmt.Sprintf("Task %s failed (queued for retry)", taskID)
+		} else {
+			msg = fmt.Sprintf("Task %s failed (blocked)", taskID)
+		}
+	case "block":
+		reason, _ := args["reason"].(string)
+		err = td.kit.Queue().Block(taskID, reason)
+		msg = fmt.Sprintf("Task %s blocked: %s", taskID, reason)
+	case "unblock":
+		err = td.kit.Queue().Unblock(taskID)
+		msg = fmt.Sprintf("Task %s unblocked and back in ready queue", taskID)
+	default:
+		return "", fmt.Errorf("unknown action: %s (use: complete, fail, block, unblock, resolve)", action)
+	}
+
+	if err != nil {
+		return "", err
+	}
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":      true,
+		"task_id": taskID,
+		"action":  action,
+		"message": msg,
+	})
+
+	return string(result), nil
+}
+
+// HandleWorkerSpawn spawns a new worker to execute a specific task.
+// Tool: autonomy_worker_spawn
+func (td *ToolDefinitions) HandleWorkerSpawn(args map[string]any) (string, error) {
+	taskID, _ := args["task_id"].(string)
+	if taskID == "" {
+		return "", fmt.Errorf("task_id is required")
+	}
+
+	task, ok := td.kit.Queue().Get(taskID)
+	if !ok {
+		return "", fmt.Errorf("task %s not found", taskID)
+	}
+
+	if task.State != TaskReady {
+		return "", fmt.Errorf("task %s is not ready (state: %s)", taskID, task.State)
+	}
+
+	dispatched, workerID, err := td.kit.Pool().dispatchOne(context.Background(), taskID)
+	if err != nil {
+		return "", err
+	}
+	if dispatched == "" {
+		return "", fmt.Errorf("task not eligible, runtime stopped, or no idle worker available")
+	}
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":        true,
+		"action":    "spawn",
+		"task_id":   taskID,
+		"worker_id": workerID,
+		"status":    "dispatched",
+		"message":   fmt.Sprintf("Task '%s' dispatched to worker %s", task.Title, workerID),
+	})
+
+	return string(result), nil
+}
+
+func ParseAcceptanceCriteria(raw any) ([]string, error) {
+	if raw == nil {
+		return nil, nil
+	}
+	var items []string
+	switch v := raw.(type) {
+	case []string:
+		items = append(items, v...)
+	case []any:
+		for _, item := range v {
+			s, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("acceptance_criteria must contain strings")
+			}
+			items = append(items, s)
+		}
+	default:
+		return nil, fmt.Errorf("acceptance_criteria must be an array of strings")
+	}
+	for i := range items {
+		items[i] = strings.TrimSpace(items[i])
+		if items[i] == "" {
+			return nil, fmt.Errorf("acceptance criterion cannot be empty")
+		}
+	}
+	if len(items) > 32 {
+		return nil, fmt.Errorf("at most 32 acceptance criteria are supported")
+	}
+	return items, nil
+}
+
+func unresolvedOperations(t *QueueTask) []Operation {
+	var out []Operation
+	for _, op := range t.Operations {
+		if op.State == "started" {
+			out = append(out, op)
+		}
+	}
+	return out
+}
+
+// HandleWorkerList lists active workers.
+// Tool: autonomy_worker_list
+func (td *ToolDefinitions) HandleWorkerList(args map[string]any) (string, error) {
+	workers := td.kit.Pool().ListWorkers()
+	stats := td.kit.Pool().Stats()
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":           true,
+		"action":       "workers",
+		"workers":      workers,
+		"total":        stats.WorkerCount,
+		"idle":         stats.IdleWorkers,
+		"busy":         stats.BusyWorkers,
+		"total_tasks":  stats.TotalTasks,
+		"failed_tasks": stats.FailedTasks,
+	})
+
+	return string(result), nil
+}
+
+// HandleHeartbeatTrigger manually triggers a heartbeat cycle.
+// Tool: autonomy_heartbeat_trigger
+func (td *ToolDefinitions) HandleHeartbeatTrigger(args map[string]any) (string, error) {
+	event := td.kit.Heartbeat().Trigger(nil)
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":           true,
+		"action":       "heartbeat",
+		"timestamp":    event.Timestamp.Format("2006-01-02 15:04:05"),
+		"mode":         event.Mode,
+		"tasks_pulled": event.TasksPulled,
+		"actions":      event.Actions,
+		"message":      fmt.Sprintf("Heartbeat triggered: %d tasks pulled, %d actions", event.TasksPulled, len(event.Actions)),
+	})
+
+	return string(result), nil
+}
+
+// HandleStatus returns the overall autonomy kit status.
+// Tool: autonomy_status
+func (td *ToolDefinitions) HandleStatus(args map[string]any) (string, error) {
+	status := td.kit.Status()
+
+	result, _ := json.Marshal(map[string]any{
+		"ok":     true,
+		"action": "status",
+		"status": status,
+		// Keep top-level status fields for existing callers.
+		"started":           status.Started,
+		"queue_ready":       status.QueueReady,
+		"queue_in_progress": status.QueueInProgress,
+		"queue_blocked":     status.QueueBlocked,
+		"queue_done":        status.QueueDone,
+		"pool_stats":        status.PoolStats,
+		"last_heartbeat":    status.LastHeartbeat,
+		"queue_store":       status.QueueStore,
+	})
+	return string(result), nil
+}
+
+func taskReportTime(task *QueueTask) time.Time {
+	if task == nil {
+		return time.Time{}
+	}
+	if !task.CompletedAt.IsZero() {
+		return task.CompletedAt
+	}
+	if !task.StartedAt.IsZero() {
+		return task.StartedAt
+	}
+	return task.CreatedAt
+}
+
+func parseToolLimit(args map[string]any, fallback, max int) int {
+	if fallback <= 0 {
+		fallback = 5
+	}
+	if max < fallback {
+		max = fallback
+	}
+	raw, ok := args["limit"]
+	if !ok {
+		return fallback
+	}
+	var n int
+	switch v := raw.(type) {
+	case int:
+		n = v
+	case int64:
+		n = int(v)
+	case float64:
+		n = int(v)
+	case json.Number:
+		parsed, err := strconv.Atoi(v.String())
+		if err == nil {
+			n = parsed
+		}
+	case string:
+		parsed, err := strconv.Atoi(strings.TrimSpace(v))
+		if err == nil {
+			n = parsed
+		}
+	}
+	if n <= 0 {
+		return fallback
+	}
+	if n > max {
+		return max
+	}
+	return n
+}
+
+func truncateToolText(text string, max int) string {
+	text = strings.TrimSpace(text)
+	if max <= 0 || len(text) <= max {
+		return text
+	}
+	return strings.TrimSpace(text[:max]) + "\n...（truncated）"
+}
+
+func safeWorkerCount(kit *AutonomyKit) int {
+	if kit == nil || kit.Pool() == nil {
+		return 0
+	}
+	return kit.Pool().Stats().WorkerCount
+}

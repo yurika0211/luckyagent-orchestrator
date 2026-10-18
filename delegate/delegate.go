@@ -1,0 +1,2135 @@
+package delegate
+
+import (
+	"context"
+	"encoding/json"
+	"fmt"
+	"os"
+	"path/filepath"
+	"regexp"
+	"sort"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/yurika0211/luckyagent-orchestrator/collab"
+	taskstore "github.com/yurika0211/luckyagent-orchestrator/task"
+)
+
+const delegateWorkspaceMarker = "LuckyAgent delegate workspace:"
+
+const (
+	DefaultTimeoutSeconds       = 120
+	minDelegateTimeoutSeconds   = 5
+	maxDelegateTimeoutSeconds   = 1800
+	DefaultListLimit            = 20
+	maxDelegateListLimit        = 100
+	defaultDelegateResultInline = 4000
+	DefaultWaitPollInterval     = 200 * time.Millisecond
+	minWaitPollInterval         = 10 * time.Millisecond
+	maxWaitPollInterval         = 5 * time.Second
+	minWaitTimeout              = 50 * time.Millisecond
+	maxWaitTaskIDs              = 100
+)
+
+var delegateWorkspacePathRe = regexp.MustCompile(`(?:/tmp/[^\s"'<>，。；；,，)）\]}]+|~[/\\]\.luckyagent[/\\]?[^\s"'<>，。；；,，)）\]}]*)`)
+
+// DelegateConfig 子代理委派配置
+type DelegateConfig struct {
+	MaxConcurrent        int           // 最大并发子代理数
+	Timeout              time.Duration // 子代理超时
+	MinTimeout           time.Duration // 最小子代理超时
+	MaxTimeout           time.Duration // 最大子代理超时
+	MaxResultBytesInline int           // task_status 内联结果上限
+	MaxChildren          int           // 单次规划允许的最大子任务数
+	AutoApprove          bool          // 自动批准子代理任务
+	ChildMaxIterations   int           // 子 Agent Loop 最大迭代次数
+	ChildTimeout         time.Duration // 子 Agent Loop 单轮超时
+	ChildAutoApprove     bool          // 子 Agent 是否自动批准工具调用
+	ChildRepeatToolLimit int           // 子 Agent 重复工具调用上限
+	ChildToolOnlyLimit   int           // 子 Agent 连续纯工具轮次上限
+	ChildDuplicateLimit  int           // 子 Agent 同 URL 抓取上限
+	ChildDisabledTools   []string      // 子 Agent 默认隐藏的工具
+	ChildAllowRecursive  bool          // 是否允许子 Agent 再次创建子 Agent
+}
+
+// DefaultDelegateConfig 默认委派配置
+func DefaultDelegateConfig() DelegateConfig {
+	return DelegateConfig{
+		MaxConcurrent:        3,
+		Timeout:              120 * time.Second,
+		MinTimeout:           minDelegateTimeoutSeconds * time.Second,
+		MaxTimeout:           maxDelegateTimeoutSeconds * time.Second,
+		MaxResultBytesInline: defaultDelegateResultInline,
+		MaxChildren:          3,
+		AutoApprove:          false,
+		ChildMaxIterations:   5,
+		ChildTimeout:         60 * time.Second,
+		ChildAutoApprove:     false,
+		ChildRepeatToolLimit: 3,
+		ChildToolOnlyLimit:   3,
+		ChildDuplicateLimit:  1,
+		ChildAllowRecursive:  false,
+	}
+}
+
+func normalizeDelegateConfig(cfg DelegateConfig) DelegateConfig {
+	if cfg.MaxConcurrent <= 0 {
+		cfg.MaxConcurrent = 3
+	}
+	if cfg.Timeout <= 0 {
+		cfg.Timeout = DefaultTimeoutSeconds * time.Second
+	}
+	if cfg.MinTimeout <= 0 {
+		cfg.MinTimeout = minDelegateTimeoutSeconds * time.Second
+	}
+	if cfg.MaxTimeout <= 0 {
+		cfg.MaxTimeout = maxDelegateTimeoutSeconds * time.Second
+	}
+	if cfg.MaxTimeout < cfg.MinTimeout {
+		cfg.MaxTimeout = cfg.MinTimeout
+	}
+	if cfg.Timeout < cfg.MinTimeout {
+		cfg.Timeout = cfg.MinTimeout
+	}
+	if cfg.Timeout > cfg.MaxTimeout {
+		cfg.Timeout = cfg.MaxTimeout
+	}
+	if cfg.MaxResultBytesInline <= 0 {
+		cfg.MaxResultBytesInline = defaultDelegateResultInline
+	}
+	if cfg.MaxChildren <= 0 {
+		cfg.MaxChildren = 3
+	}
+	if cfg.ChildMaxIterations <= 0 {
+		cfg.ChildMaxIterations = 5
+	}
+	if cfg.ChildTimeout <= 0 {
+		cfg.ChildTimeout = 60 * time.Second
+	}
+	if cfg.ChildRepeatToolLimit <= 0 {
+		cfg.ChildRepeatToolLimit = 3
+	}
+	if cfg.ChildToolOnlyLimit <= 0 {
+		cfg.ChildToolOnlyLimit = 3
+	}
+	if cfg.ChildDuplicateLimit <= 0 {
+		cfg.ChildDuplicateLimit = 1
+	}
+	if cfg.ChildDisabledTools != nil {
+		cfg.ChildDisabledTools = append([]string(nil), cfg.ChildDisabledTools...)
+	}
+	return cfg
+}
+
+func prepareDelegateExecutionContext(taskID, description, contextStr string, policies ...WorkspacePolicy) (string, string, error) {
+	policy := workspacePolicy(policies)
+	workspace := findDelegateWorkspace(policy, description, contextStr)
+	if workspace == "" {
+		workspace = defaultDelegateWorkspace(taskID)
+	}
+	workspace = normalizeDelegateWorkspace(workspace, policy)
+	if err := policy.Validate(workspace); err != nil {
+		workspace = defaultDelegateWorkspace(taskID)
+	}
+	workspace = normalizeDelegateWorkspace(workspace, policy)
+	if err := policy.Validate(workspace); err != nil {
+		return "", "", err
+	}
+	if err := os.MkdirAll(workspace, 0o755); err != nil {
+		return "", "", fmt.Errorf("create delegate workspace: %w", err)
+	}
+	return workspace, appendDelegateWorkspaceContext(contextStr, workspace), nil
+}
+
+func findDelegateWorkspace(policy WorkspacePolicy, parts ...string) string {
+	for _, part := range parts {
+		for _, candidate := range delegateWorkspacePathRe.FindAllString(part, -1) {
+			candidate = normalizeDelegateWorkspace(candidate, policy)
+			if candidate == "" {
+				continue
+			}
+			if err := policy.Validate(candidate); err == nil {
+				return candidate
+			}
+		}
+	}
+	return ""
+}
+
+func defaultDelegateWorkspace(taskID string) string {
+	return filepath.Join(os.TempDir(), "luckyagent-delegate", sanitizeDelegateTaskID(taskID))
+}
+
+func sanitizeDelegateTaskID(taskID string) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return "task"
+	}
+	var b strings.Builder
+	for _, r := range taskID {
+		switch {
+		case r >= 'a' && r <= 'z':
+			b.WriteRune(r)
+		case r >= 'A' && r <= 'Z':
+			b.WriteRune(r)
+		case r >= '0' && r <= '9':
+			b.WriteRune(r)
+		case r == '-' || r == '_':
+			b.WriteRune(r)
+		}
+	}
+	if b.Len() == 0 {
+		return "task"
+	}
+	return b.String()
+}
+
+func normalizeDelegateWorkspace(path string, policy WorkspacePolicy) string {
+	path = strings.TrimSpace(path)
+	path = strings.TrimRight(path, ".,;:，。；：、)]}>\n\r\t ")
+	path = policy.Expand(path)
+	if path == "" {
+		return ""
+	}
+	clean := filepath.Clean(path)
+	if info, err := os.Stat(clean); err == nil && !info.IsDir() {
+		return filepath.Dir(clean)
+	}
+	base := filepath.Base(clean)
+	if ext := filepath.Ext(base); ext != "" && !strings.HasPrefix(base, ".") {
+		return filepath.Dir(clean)
+	}
+	return clean
+}
+
+func appendDelegateWorkspaceContext(contextStr, workspace string) string {
+	block := fmt.Sprintf(`%s
+Current working directory: %s
+Allowed file roots: /tmp/ and ~/.luckyagent/.
+Use relative file paths under the current working directory, or explicit paths under the allowed roots. Do not use /home or bare ~, and do not assume "." is the repository root; "." refers to the current working directory above.`, delegateWorkspaceMarker, workspace)
+	contextStr = strings.TrimSpace(contextStr)
+	if contextStr == "" {
+		return block
+	}
+	if strings.Contains(contextStr, delegateWorkspaceMarker) {
+		return contextStr
+	}
+	return contextStr + "\n\n" + block
+}
+
+func ExtractDelegateWorkspace(contextStr string) string {
+	return ExtractDelegateWorkspaceWithPolicy(contextStr, workspacePolicy(nil))
+}
+
+// ExtractDelegateWorkspaceWithPolicy reads an execution workspace using the
+// embedding application's path expansion and validation rules.
+func ExtractDelegateWorkspaceWithPolicy(contextStr string, policy WorkspacePolicy) string {
+	policy = workspacePolicy([]WorkspacePolicy{policy})
+	idx := strings.Index(contextStr, delegateWorkspaceMarker)
+	if idx < 0 {
+		return ""
+	}
+	for _, line := range strings.Split(contextStr[idx:], "\n") {
+		key, value, ok := strings.Cut(strings.TrimSpace(line), ":")
+		if !ok || !strings.EqualFold(strings.TrimSpace(key), "Current working directory") {
+			continue
+		}
+		workspace := normalizeDelegateWorkspace(value, policy)
+		if workspace == "" {
+			return ""
+		}
+		if err := policy.Validate(workspace); err != nil {
+			return ""
+		}
+		return workspace
+	}
+	return ""
+}
+
+// TaskStatus 子代理任务状态
+type TaskStatus int
+
+const (
+	StatusPending TaskStatus = iota
+	StatusRunning
+	StatusCompleted
+	StatusFailed
+	StatusCancelled
+)
+
+func (s TaskStatus) String() string {
+	switch s {
+	case StatusPending:
+		return "pending"
+	case StatusRunning:
+		return "running"
+	case StatusCompleted:
+		return "completed"
+	case StatusFailed:
+		return "failed"
+	case StatusCancelled:
+		return "cancelled"
+	default:
+		return "unknown"
+	}
+}
+
+// DelegateTask 子代理任务
+type DelegateTask struct {
+	ID             string
+	Description    string
+	Context        string
+	Workspace      string
+	Mode           taskstore.Mode
+	PlannedMode    taskstore.Mode
+	PlannerSummary string
+	Status         TaskStatus
+	Result         string
+	Error          string
+	StartedAt      time.Time
+	CompletedAt    time.Time
+	ToolCalls      int
+	LastTool       string
+	OwnerSessionID string
+	// ExecutionSessionID is a stable, durable session for this delegated run.
+	// ParentSessionID is the session that requested the delegation. They are
+	// intentionally separate so a UI can open either side of the relationship.
+	ExecutionSessionID     string
+	ParentSessionID        string
+	Role                   string
+	OwnerSource            string
+	RequestKey             string
+	AllowRecursiveDelegate bool
+}
+
+// Owner identifies a parent session and its idempotent delegation request.
+// Adapters derive RequestKey from their request context before dispatching.
+type Owner struct {
+	SessionID  string
+	Source     string
+	RequestKey string
+}
+
+func (owner Owner) scoped() bool {
+	return strings.TrimSpace(owner.SessionID) != ""
+}
+
+type StartResponse struct {
+	TaskID             string `json:"task_id"`
+	ExecutionSessionID string `json:"execution_session_id,omitempty"`
+	ParentSessionID    string `json:"parent_session_id,omitempty"`
+	Role               string `json:"role,omitempty"`
+	Status             string `json:"status"`
+	Mode               string `json:"mode"`
+	PlannedMode        string `json:"planned_mode,omitempty"`
+	PlannerSummary     string `json:"planner_summary,omitempty"`
+	TraceAvailable     bool   `json:"trace_available,omitempty"`
+	Workspace          string `json:"workspace"`
+	TimeoutSeconds     int    `json:"timeout_seconds"`
+	Message            string `json:"message"`
+}
+
+type StatusResponse struct {
+	TaskID             string                          `json:"task_id"`
+	ExecutionSessionID string                          `json:"execution_session_id,omitempty"`
+	ParentSessionID    string                          `json:"parent_session_id,omitempty"`
+	Role               string                          `json:"role,omitempty"`
+	Source             string                          `json:"source,omitempty"`
+	Mode               string                          `json:"mode,omitempty"`
+	ParentID           string                          `json:"parent_id,omitempty"`
+	Description        string                          `json:"description"`
+	Workspace          string                          `json:"workspace"`
+	Status             string                          `json:"status"`
+	ResultSummary      string                          `json:"result_summary,omitempty"`
+	Result             string                          `json:"result,omitempty"`
+	ResultBytes        int                             `json:"result_bytes"`
+	ResultTruncated    bool                            `json:"result_truncated"`
+	Error              string                          `json:"error,omitempty"`
+	StartedAt          string                          `json:"started_at"`
+	CompletedAt        string                          `json:"completed_at"`
+	ToolCalls          int                             `json:"tool_calls,omitempty"`
+	ElapsedMS          int64                           `json:"elapsed_ms,omitempty"`
+	LastTool           string                          `json:"last_tool,omitempty"`
+	Observation        *taskstore.MainAgentObservation `json:"observation,omitempty"`
+	Events             []taskstore.Event               `json:"events,omitempty"`
+	PlannerTrace       json.RawMessage                 `json:"planner_trace,omitempty"`
+}
+
+type ListItem struct {
+	TaskID             string `json:"task_id"`
+	ExecutionSessionID string `json:"execution_session_id,omitempty"`
+	ParentSessionID    string `json:"parent_session_id,omitempty"`
+	Role               string `json:"role,omitempty"`
+	Source             string `json:"source,omitempty"`
+	Mode               string `json:"mode,omitempty"`
+	ParentID           string `json:"parent_id,omitempty"`
+	Description        string `json:"description"`
+	Workspace          string `json:"workspace"`
+	Status             string `json:"status"`
+	ResultSummary      string `json:"result_summary,omitempty"`
+	ResultBytes        int    `json:"result_bytes,omitempty"`
+	ResultTruncated    bool   `json:"result_truncated,omitempty"`
+	Error              string `json:"error,omitempty"`
+	StartedAt          string `json:"started_at"`
+	CompletedAt        string `json:"completed_at,omitempty"`
+	ToolCalls          int    `json:"tool_calls,omitempty"`
+	ElapsedMS          int64  `json:"elapsed_ms,omitempty"`
+	LastTool           string `json:"last_tool,omitempty"`
+}
+
+type ListResponse struct {
+	Tasks    []ListItem     `json:"tasks"`
+	Count    int            `json:"count"`
+	Total    int            `json:"total"`
+	ByStatus map[string]int `json:"by_status"`
+}
+
+type CancelResponse struct {
+	TaskID  string `json:"task_id"`
+	Status  string `json:"status"`
+	Message string `json:"message"`
+}
+
+// WaitResponse is returned by wait_for_tasks. It intentionally uses
+// the same detailed task representation as task_status so callers can
+// synthesize completed subtask results without making a second round trip.
+type WaitResponse struct {
+	Tasks          []StatusResponse `json:"tasks"`
+	AllTerminal    bool             `json:"all_terminal"`
+	TimedOut       bool             `json:"timed_out"`
+	PendingTaskIDs []string         `json:"pending_task_ids"`
+	ElapsedMS      int64            `json:"elapsed_ms"`
+}
+
+// AgentExecutorFunc 子代理执行函数 — 通过 Agent Loop 真正执行任务
+// v0.38.0: 让 delegate 不再是占位，而是真正走 LLM
+type AgentExecutorFunc func(ctx context.Context, description, contextStr string) (string, error)
+
+// AgentExecutorOptions carries per-task child execution policy without
+// changing the original AgentExecutorFunc signature.
+type AgentExecutorOptions struct {
+	AllowRecursiveDelegate bool
+}
+
+// AgentExecutorWithOptionsFunc executes a delegated child with effective
+// per-task policy options.
+type AgentExecutorWithOptionsFunc func(ctx context.Context, description, contextStr string, options AgentExecutorOptions) (string, error)
+
+type delegateTaskIDContextKey struct{}
+
+type delegateExecutionSessionIDContextKey struct{}
+
+// DelegateTaskID returns the task id while a delegate executor is running.
+// It lets the host Agent attach execution metrics without changing the
+// long-standing AgentExecutorFunc signature.
+func DelegateTaskID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(delegateTaskIDContextKey{}).(string)
+	return strings.TrimSpace(id)
+}
+
+// DelegateExecutionSessionID returns the stable session assigned to the
+// delegated task currently being executed. Agent executors use this to resume
+// the same transcript on retries or when a client opens the task from a UI.
+func DelegateExecutionSessionID(ctx context.Context) string {
+	if ctx == nil {
+		return ""
+	}
+	id, _ := ctx.Value(delegateExecutionSessionIDContextKey{}).(string)
+	return strings.TrimSpace(id)
+}
+
+// DelegateManager 子代理委派管理器
+type DelegateManager struct {
+	mu                       sync.RWMutex
+	config                   DelegateConfig
+	workspacePolicy          WorkspacePolicy
+	tasks                    map[string]*DelegateTask
+	cancels                  map[string]context.CancelFunc
+	nextID                   int
+	agentExecutor            AgentExecutorFunc // v0.38.0: 真正的 Agent 执行器
+	agentExecutorWithOptions AgentExecutorWithOptionsFunc
+	mcpExecutor              func(context.Context, string, string, map[string]any) (string, error)
+	sessionInitializer       func(*DelegateTask) error
+	taskStore                taskstore.Store
+	taskEvents               *taskstore.EventBus
+}
+
+// NewDelegateManager 创建子代理委派管理器
+func NewDelegateManager(cfg DelegateConfig, policies ...WorkspacePolicy) *DelegateManager {
+	return &DelegateManager{
+		config:          normalizeDelegateConfig(cfg),
+		workspacePolicy: workspacePolicy(policies),
+		tasks:           make(map[string]*DelegateTask),
+		cancels:         make(map[string]context.CancelFunc),
+	}
+}
+
+// SetMCPExecutor injects the host's adapter. Delegation never owns an MCP
+// transport or invents a successful result when no executor is configured.
+func (dm *DelegateManager) SetMCPExecutor(fn func(context.Context, string, string, map[string]any) (string, error)) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.mcpExecutor = fn
+}
+
+// SetAgentExecutor 设置 Agent 执行器 (v0.38.0)
+// 让 delegate_task 工具真正通过 Agent Loop 执行
+func (dm *DelegateManager) SetAgentExecutor(fn AgentExecutorFunc) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.agentExecutor = fn
+	dm.agentExecutorWithOptions = nil
+}
+
+// SetAgentExecutorWithOptions installs an executor that receives effective
+// per-task child policy while preserving SetAgentExecutor compatibility.
+func (dm *DelegateManager) SetAgentExecutorWithOptions(fn AgentExecutorWithOptionsFunc) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.agentExecutorWithOptions = fn
+	dm.agentExecutor = nil
+}
+
+// SetSessionInitializer provisions the execution conversation before the task
+// is returned to its caller. The executor will later use this same session ID.
+func (dm *DelegateManager) SetSessionInitializer(fn func(*DelegateTask) error) {
+	dm.mu.Lock()
+	dm.sessionInitializer = fn
+	dm.mu.Unlock()
+}
+
+// Config returns the normalized delegate runtime configuration.
+func (dm *DelegateManager) Config() DelegateConfig {
+	if dm == nil {
+		return normalizeDelegateConfig(DelegateConfig{})
+	}
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+	cfg := dm.config
+	cfg.ChildDisabledTools = append([]string(nil), cfg.ChildDisabledTools...)
+	return cfg
+}
+
+func (dm *DelegateManager) SetTaskStore(store taskstore.Store) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.taskStore = store
+	if store == nil {
+		dm.taskEvents = nil
+		return
+	}
+	dm.taskEvents = taskstore.NewEventBus(store)
+}
+
+// RecordExecutionMetrics attaches host Agent loop metrics to a delegated task.
+// The values are persisted when the task reaches a terminal state.
+func (dm *DelegateManager) RecordExecutionMetrics(taskID string, toolCalls int, lastTool string) {
+	if dm == nil || strings.TrimSpace(taskID) == "" {
+		return
+	}
+	dm.mu.Lock()
+	task := dm.tasks[taskID]
+	store := dm.taskStore
+	events := dm.taskEvents
+	if task == nil {
+		dm.mu.Unlock()
+		return
+	}
+	if toolCalls >= 0 {
+		task.ToolCalls = toolCalls
+	}
+	if strings.TrimSpace(lastTool) != "" {
+		task.LastTool = strings.TrimSpace(lastTool)
+	}
+	snapshot := cloneDelegateTask(task)
+	dm.mu.Unlock()
+	if store == nil {
+		return
+	}
+	if record, ok, err := store.Get(taskID); err == nil && ok {
+		record.Outcome.Cost.ToolCalls = snapshot.ToolCalls
+		record.Outcome.Cost.Elapsed = delegateElapsedMillisAsDuration(snapshot.StartedAt, time.Now())
+		if record.Metadata == nil {
+			record.Metadata = make(map[string]string)
+		}
+		if snapshot.LastTool != "" {
+			record.Metadata["last_tool"] = snapshot.LastTool
+		}
+		_ = store.Update(record)
+		if events != nil {
+			_ = events.Emit(taskstore.Event{Type: taskstore.EventToolUsed, TaskID: taskID, Status: record.Status, Cost: record.Outcome.Cost, Metadata: map[string]string{"last_tool": snapshot.LastTool}})
+		}
+	}
+}
+
+func delegateElapsedMillisAsDuration(start time.Time, end time.Time) time.Duration {
+	if start.IsZero() || end.Before(start) {
+		return 0
+	}
+	return end.Sub(start)
+}
+
+// delegateExecutionSessionID is deterministic so the task-to-session link
+// remains valid after a process restart and never changes during retries or
+// status polling.
+func delegateExecutionSessionID(taskID string) string {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return ""
+	}
+	return "delegate-" + taskID
+}
+
+func recordExecutionRefs(record taskstore.Record) (executionSessionID, parentSessionID, role string) {
+	executionSessionID = strings.TrimSpace(record.ExecutionSessionID)
+	parentSessionID = strings.TrimSpace(record.ParentSessionID)
+	role = strings.TrimSpace(record.Role)
+	if executionSessionID == "" {
+		executionSessionID = strings.TrimSpace(record.Metadata["execution_session_id"])
+	}
+	if parentSessionID == "" {
+		parentSessionID = strings.TrimSpace(record.Metadata["parent_session_id"])
+		if parentSessionID == "" {
+			parentSessionID = strings.TrimSpace(record.Metadata["owner_session_id"])
+		}
+	}
+	if role == "" {
+		role = strings.TrimSpace(record.Metadata["role"])
+	}
+	return executionSessionID, parentSessionID, role
+}
+
+// RetryTask creates a fresh delegated task from a failed/cancelled task. The
+// original task remains immutable for audit history; the returned value is the
+// normal delegate_task start response for the new task.
+func (dm *DelegateManager) RetryTask(taskID string) (string, error) {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return "", fmt.Errorf("task_id is required")
+	}
+	dm.mu.RLock()
+	task := dm.tasks[taskID]
+	store := dm.taskStore
+	dm.mu.RUnlock()
+	if task == nil && store != nil {
+		record, ok, err := store.Get(taskID)
+		if err != nil {
+			return "", err
+		}
+		if !ok {
+			return "", fmt.Errorf("task not found: %s", taskID)
+		}
+		if record.Status != taskstore.StatusFailed && record.Status != taskstore.StatusCancelled && record.Status != taskstore.StatusBlocked {
+			return "", fmt.Errorf("task %s is not retryable from status %s", taskID, record.Status)
+		}
+		return dm.HandleDelegate(map[string]any{"description": record.Description, "context": record.Input})
+	}
+	if task == nil {
+		return "", fmt.Errorf("task not found: %s", taskID)
+	}
+	if task.Status != StatusFailed && task.Status != StatusCancelled {
+		return "", fmt.Errorf("task %s is not retryable from status %s", taskID, task.Status.String())
+	}
+	return dm.HandleDelegate(map[string]any{"description": task.Description, "context": task.Context})
+}
+
+func (dm *DelegateManager) delegateTimeoutFromArgs(args map[string]any) time.Duration {
+	seconds := int(dm.config.Timeout.Seconds())
+	if raw, ok := args["timeout"]; ok {
+		if n, ok := delegateIntArg(raw); ok {
+			seconds = n
+		}
+	}
+	timeout := time.Duration(seconds) * time.Second
+	if timeout <= 0 {
+		timeout = dm.config.Timeout
+	}
+	if timeout < dm.config.MinTimeout {
+		timeout = dm.config.MinTimeout
+	}
+	if timeout > dm.config.MaxTimeout {
+		timeout = dm.config.MaxTimeout
+	}
+	return timeout
+}
+
+func delegateIntArg(raw any) (int, bool) {
+	switch v := raw.(type) {
+	case int:
+		return v, true
+	case int64:
+		return int(v), true
+	case float64:
+		return int(v), true
+	case float32:
+		return int(v), true
+	case json.Number:
+		n, err := strconv.Atoi(v.String())
+		return n, err == nil
+	case string:
+		n, err := strconv.Atoi(strings.TrimSpace(v))
+		return n, err == nil
+	default:
+		return 0, false
+	}
+}
+
+func delegateDurationSecondsArg(raw any) (time.Duration, bool) {
+	var seconds float64
+	switch v := raw.(type) {
+	case int:
+		seconds = float64(v)
+	case int64:
+		seconds = float64(v)
+	case float64:
+		seconds = v
+	case float32:
+		seconds = float64(v)
+	case json.Number:
+		parsed, err := strconv.ParseFloat(v.String(), 64)
+		if err != nil {
+			return 0, false
+		}
+		seconds = parsed
+	case string:
+		parsed, err := strconv.ParseFloat(strings.TrimSpace(v), 64)
+		if err != nil {
+			return 0, false
+		}
+		seconds = parsed
+	default:
+		return 0, false
+	}
+	if seconds <= 0 {
+		return 0, false
+	}
+	return time.Duration(seconds * float64(time.Second)), true
+}
+
+func delegateBoolArg(args map[string]any, key string, def bool) bool {
+	if args == nil {
+		return def
+	}
+	raw, ok := args[key]
+	if !ok {
+		return def
+	}
+	switch v := raw.(type) {
+	case bool:
+		return v
+	case string:
+		parsed, err := strconv.ParseBool(strings.TrimSpace(v))
+		if err == nil {
+			return parsed
+		}
+	}
+	return def
+}
+
+func delegateStringArg(args map[string]any, key string) string {
+	if args == nil {
+		return ""
+	}
+	if s, ok := args[key].(string); ok {
+		return strings.TrimSpace(s)
+	}
+	return ""
+}
+
+func delegateModeArg(args map[string]any) (taskstore.Mode, error) {
+	mode := strings.ToLower(strings.TrimSpace(delegateStringArg(args, "mode")))
+	if mode == "" {
+		mode = string(taskstore.ModeSingle)
+	}
+	switch taskstore.Mode(mode) {
+	case taskstore.ModeSingle, taskstore.ModeAuto, taskstore.ModeParallel, taskstore.ModePipeline, taskstore.ModeDebate, taskstore.ModeAutonomyQueue:
+		return taskstore.Mode(mode), nil
+	default:
+		return "", fmt.Errorf("unsupported delegate mode %q", mode)
+	}
+}
+
+func planDelegateTaskMode(description, contextStr string, requested taskstore.Mode, timeout time.Duration, maxChildren int) (taskstore.Mode, taskstore.Mode, string, any) {
+	if requested == "" {
+		requested = taskstore.ModeSingle
+	}
+	if maxChildren <= 0 {
+		maxChildren = 3
+	}
+	if requested != taskstore.ModeAuto {
+		summary := "Using explicit " + string(requested) + " mode."
+		return requested, requested, summary, map[string]any{
+			"planner":        "explicit",
+			"requested_mode": requested,
+			"selected_mode":  requested,
+			"summary":        summary,
+		}
+	}
+	if isSimpleDelegateTask(description, contextStr) {
+		summary := "Kept single mode because the task appears simple and does not need multi-agent coordination."
+		return taskstore.ModeSingle, taskstore.ModeSingle, summary, map[string]any{
+			"planner":        "delegate-auto-guard",
+			"requested_mode": requested,
+			"selected_mode":  taskstore.ModeSingle,
+			"summary":        summary,
+			"simple_guard":   true,
+		}
+	}
+
+	planner := collab.NewPlanner(nil)
+	allowed := []collab.CollabMode{collab.ModePipeline, collab.ModeParallel, collab.ModeDebate}
+	plan := planner.Plan(collab.PlanRequest{
+		Description:  description,
+		Input:        contextStr,
+		AgentIDs:     syntheticAgentIDs(maxChildren),
+		Timeout:      timeout,
+		AllowedModes: allowed,
+	})
+	selected := taskModeFromCollab(plan.Mode)
+	if selected == "" {
+		selected = taskstore.ModeSingle
+	}
+	summary := fmt.Sprintf("Selected %s mode with %s.", selected, strings.TrimSpace(plan.DecisionBasis))
+	return selected, selected, summary, plan
+}
+
+func isSimpleDelegateTask(description, contextStr string) bool {
+	text := strings.ToLower(description + "\n" + contextStr)
+	if len(strings.Fields(text)) <= 18 &&
+		!strings.Contains(text, "\n-") &&
+		!strings.Contains(text, "\n1.") &&
+		!strings.Contains(text, " and ") &&
+		!strings.Contains(text, "、") &&
+		!strings.Contains(text, "多个") &&
+		!strings.Contains(text, "multi") {
+		return true
+	}
+	return false
+}
+
+func syntheticAgentIDs(maxChildren int) []string {
+	if maxChildren <= 0 {
+		maxChildren = 3
+	}
+	if maxChildren > 8 {
+		maxChildren = 8
+	}
+	ids := make([]string, 0, maxChildren)
+	for i := 1; i <= maxChildren; i++ {
+		ids = append(ids, fmt.Sprintf("delegate-%d", i))
+	}
+	return ids
+}
+
+func taskModeFromCollab(mode collab.CollabMode) taskstore.Mode {
+	switch mode {
+	case collab.ModeParallel:
+		return taskstore.ModeParallel
+	case collab.ModePipeline:
+		return taskstore.ModePipeline
+	case collab.ModeDebate:
+		return taskstore.ModeDebate
+	default:
+		return ""
+	}
+}
+
+func isValidDelegateStatus(status string) bool {
+	switch status {
+	case StatusPending.String(), StatusRunning.String(), StatusCompleted.String(), StatusFailed.String(), StatusCancelled.String():
+		return true
+	default:
+		return false
+	}
+}
+
+func cloneDelegateTask(task *DelegateTask) DelegateTask {
+	if task == nil {
+		return DelegateTask{}
+	}
+	return *task
+}
+
+func delegateElapsedMillis(start, end time.Time) int64 {
+	if start.IsZero() {
+		return 0
+	}
+	if end.IsZero() {
+		end = time.Now()
+	}
+	if end.Before(start) {
+		return 0
+	}
+	return end.Sub(start).Milliseconds()
+}
+
+func summarizeDelegateResult(result string, maxBytes int) (summary, inline string, resultBytes int, truncated bool) {
+	result = strings.TrimSpace(result)
+	resultBytes = len(result)
+	if result == "" {
+		return "", "", 0, false
+	}
+	paragraph := result
+	for _, part := range strings.Split(result, "\n\n") {
+		if trimmed := strings.TrimSpace(part); trimmed != "" {
+			paragraph = trimmed
+			break
+		}
+	}
+	summary = paragraph
+	if len(summary) > 300 {
+		summary = summary[:300] + "... (truncated)"
+	}
+	inline = result
+	if maxBytes > 0 && len(inline) > maxBytes {
+		inline = inline[:maxBytes] + "\n... (truncated)"
+		truncated = true
+	}
+	return summary, inline, resultBytes, truncated
+}
+
+func formatDelegateCompletedAt(t time.Time) string {
+	if t.IsZero() {
+		return ""
+	}
+	return t.Format(time.RFC3339)
+}
+
+func isTerminalDelegateStatus(status string) bool {
+	switch strings.ToLower(strings.TrimSpace(status)) {
+	case StatusCompleted.String(), StatusFailed.String(), StatusCancelled.String():
+		return true
+	default:
+		return false
+	}
+}
+
+// HandleDelegate 处理委派请求
+func (dm *DelegateManager) HandleDelegate(args map[string]any) (string, error) {
+	return dm.HandleDelegateWithOwner(args, Owner{})
+}
+
+// RunExplorationHandoff starts one sub-agent for accumulated exploration and
+// waits until it finishes. The returned text is a short evidence summary; the
+// child keeps the full tool transcript in its own session.
+func (dm *DelegateManager) RunExplorationHandoff(ctx context.Context, ownerSessionID, description, contextStr string, timeout time.Duration) (taskID, summary string, err error) {
+	if dm == nil {
+		return "", "", fmt.Errorf("delegate manager is not configured")
+	}
+	if timeout <= 0 {
+		timeout = dm.Config().Timeout
+	}
+	if timeout <= 0 {
+		timeout = 60 * time.Second
+	}
+	started, err := dm.HandleDelegateWithOwner(map[string]any{
+		"description": description,
+		"context":     contextStr,
+		"timeout":     int(timeout.Seconds()),
+		"mode":        string(taskstore.ModeSingle),
+	}, Owner{SessionID: ownerSessionID, Source: "context-handoff"})
+	if err != nil {
+		return "", "", err
+	}
+	var start StartResponse
+	if err := json.Unmarshal([]byte(started), &start); err != nil {
+		return "", "", fmt.Errorf("decode handoff start: %w", err)
+	}
+	if strings.TrimSpace(start.TaskID) == "" {
+		return "", "", fmt.Errorf("handoff did not return a task id")
+	}
+	waited, err := dm.HandleWaitForTasksForSession(ctx, map[string]any{
+		"task_ids":       []any{start.TaskID},
+		"include_result": true,
+		"timeout":        int(timeout.Seconds()),
+	}, ownerSessionID)
+	if err != nil {
+		return start.TaskID, "", err
+	}
+	var wait WaitResponse
+	if err := json.Unmarshal([]byte(waited), &wait); err != nil {
+		return start.TaskID, "", fmt.Errorf("decode handoff wait: %w", err)
+	}
+	if len(wait.Tasks) == 0 {
+		return start.TaskID, "", fmt.Errorf("handoff task %s returned no status", start.TaskID)
+	}
+	task := wait.Tasks[0]
+	summary = strings.TrimSpace(task.ResultSummary)
+	if summary == "" {
+		summary = strings.TrimSpace(task.Result)
+	}
+	if summary == "" {
+		summary = "sub-agent finished without a summary"
+	}
+	if task.Error != "" {
+		summary = strings.TrimSpace(summary + "\nfailure: " + task.Error)
+	}
+	return start.TaskID, summary, nil
+}
+
+func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Owner) (string, error) {
+	description, ok := args["description"].(string)
+	description = strings.TrimSpace(description)
+	if !ok || description == "" {
+		return "", fmt.Errorf("description is required")
+	}
+
+	contextStr := ""
+	if c, ok := args["context"]; ok {
+		contextStr, _ = c.(string)
+	}
+
+	timeout := dm.delegateTimeoutFromArgs(args)
+	requestedMode, err := delegateModeArg(args)
+	if err != nil {
+		return "", err
+	}
+	delegateCfg := dm.Config()
+	maxChildren := delegateCfg.MaxChildren
+	if maxChildren <= 0 {
+		maxChildren = 3
+	}
+	if n, ok := delegateIntArg(args["max_children"]); ok {
+		maxChildren = n
+	}
+	if maxChildren <= 0 {
+		maxChildren = 1
+	}
+	if maxChildren > delegateCfg.MaxChildren {
+		maxChildren = delegateCfg.MaxChildren
+	}
+	mode, plannedMode, plannerSummary, plannerTrace := planDelegateTaskMode(description, contextStr, requestedMode, timeout, maxChildren)
+	allowRecursive := delegateBoolArg(args, "allow_recursive_delegate", false) && delegateCfg.ChildAllowRecursive
+
+	// Reuse an existing task when the same request is dispatched more than
+	// once. This makes retries from a streaming provider idempotent.
+	dm.mu.RLock()
+	running := 0
+	for _, t := range dm.tasks {
+		if owner.scoped() && owner.RequestKey != "" && t.OwnerSessionID == owner.SessionID && t.RequestKey == owner.RequestKey {
+			response, _ := json.Marshal(StartResponse{
+				TaskID:             t.ID,
+				ExecutionSessionID: t.ExecutionSessionID,
+				ParentSessionID:    t.ParentSessionID,
+				Role:               t.Role,
+				Status:             t.Status.String(),
+				Mode:               string(t.Mode),
+				PlannedMode:        string(t.PlannedMode),
+				PlannerSummary:     t.PlannerSummary,
+				Workspace:          t.Workspace,
+				TimeoutSeconds:     int(timeout.Seconds()),
+				Message:            fmt.Sprintf("Task '%s' already exists for this request.", t.ID),
+			})
+			dm.mu.RUnlock()
+			return string(response), nil
+		}
+		if t.Status == StatusRunning {
+			running++
+		}
+	}
+	dm.mu.RUnlock()
+
+	if running >= dm.config.MaxConcurrent {
+		return "", fmt.Errorf("max concurrent tasks reached (%d)", dm.config.MaxConcurrent)
+	}
+
+	// 创建任务
+	dm.mu.Lock()
+	dm.nextID++
+	// Keep task IDs unique across runtime restarts; the counter alone would
+	// recreate task-1 and could reuse its persisted execution session.
+	taskID := fmt.Sprintf("task-%d-%d", time.Now().UnixNano(), dm.nextID)
+	executionSessionID := delegateExecutionSessionID(taskID)
+	workspace, enrichedContext, err := prepareDelegateExecutionContext(taskID, description, contextStr, dm.workspacePolicy)
+	if err != nil {
+		dm.mu.Unlock()
+		return "", err
+	}
+	task := &DelegateTask{
+		ID:                     taskID,
+		Description:            description,
+		Context:                contextStr,
+		Workspace:              workspace,
+		Mode:                   mode,
+		PlannedMode:            plannedMode,
+		PlannerSummary:         plannerSummary,
+		Status:                 StatusPending,
+		StartedAt:              time.Now(),
+		OwnerSessionID:         owner.SessionID,
+		ExecutionSessionID:     executionSessionID,
+		ParentSessionID:        owner.SessionID,
+		Role:                   "subagent",
+		OwnerSource:            owner.Source,
+		RequestKey:             owner.RequestKey,
+		AllowRecursiveDelegate: allowRecursive,
+	}
+	dm.tasks[taskID] = task
+	store := dm.taskStore
+	events := dm.taskEvents
+	initializeSession := dm.sessionInitializer
+	dm.mu.Unlock()
+	if initializeSession != nil {
+		snapshot := cloneDelegateTask(task)
+		if err := initializeSession(&snapshot); err != nil {
+			dm.mu.Lock()
+			delete(dm.tasks, taskID)
+			dm.mu.Unlock()
+			return "", fmt.Errorf("initialize delegate session: %w", err)
+		}
+	}
+
+	dm.recordDelegateTaskCreated(store, events, task, timeout, maxChildren, allowRecursive, plannerTrace)
+
+	// 异步执行
+	go dm.executeTask(taskID, description, enrichedContext, timeout)
+
+	result, _ := json.Marshal(StartResponse{
+		TaskID:             taskID,
+		ExecutionSessionID: executionSessionID,
+		ParentSessionID:    owner.SessionID,
+		Role:               "subagent",
+		Status:             StatusRunning.String(),
+		Mode:               string(mode),
+		PlannedMode:        string(plannedMode),
+		PlannerSummary:     plannerSummary,
+		TraceAvailable:     plannerTrace != nil,
+		Workspace:          workspace,
+		TimeoutSeconds:     int(timeout.Seconds()),
+		Message:            fmt.Sprintf("Task '%s' delegated. Use wait_for_tasks with this task ID before synthesizing a final answer.", taskID),
+	})
+
+	return string(result), nil
+}
+
+// executeTask 执行子代理任务
+// v0.38.0: 通过 Agent Loop 真正执行子代理任务
+func (dm *DelegateManager) executeTask(taskID, description, contextStr string, timeout time.Duration) {
+	dm.mu.Lock()
+	task := dm.tasks[taskID]
+	if task == nil || task.Status == StatusCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	if strings.TrimSpace(task.ExecutionSessionID) == "" {
+		task.ExecutionSessionID = delegateExecutionSessionID(taskID)
+	}
+	task.Status = StatusRunning
+	baseCtx := context.WithValue(context.Background(), delegateTaskIDContextKey{}, taskID)
+	baseCtx = context.WithValue(baseCtx, delegateExecutionSessionIDContextKey{}, task.ExecutionSessionID)
+	ctx, cancel := context.WithTimeout(baseCtx, timeout)
+	dm.cancels[taskID] = cancel
+	executor := dm.agentExecutor
+	executorWithOptions := dm.agentExecutorWithOptions
+	allowRecursive := task.AllowRecursiveDelegate && dm.config.ChildAllowRecursive
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+	dm.recordDelegateTaskStarted(store, events, task)
+	defer func() {
+		cancel()
+		dm.mu.Lock()
+		delete(dm.cancels, taskID)
+		dm.mu.Unlock()
+	}()
+
+	// v0.38.0: 如果配置了 agentExecutor，通过 Agent Loop 执行
+	if executorWithOptions != nil || executor != nil {
+		var result string
+		var err error
+		if executorWithOptions != nil {
+			result, err = executorWithOptions(ctx, description, contextStr, AgentExecutorOptions{
+				AllowRecursiveDelegate: allowRecursive,
+			})
+		} else {
+			result, err = executor(ctx, description, contextStr)
+		}
+		dm.mu.Lock()
+		if task.Status == StatusCancelled {
+			// Cancellation was requested through delegate_cancel; preserve it.
+		} else if err != nil {
+			task.Status = StatusFailed
+			task.Error = err.Error()
+		} else {
+			task.Status = StatusCompleted
+			task.Result = result
+		}
+		if task.CompletedAt.IsZero() {
+			task.CompletedAt = time.Now()
+		}
+		snapshot := cloneDelegateTask(task)
+		dm.mu.Unlock()
+		dm.recordDelegateTaskFinished(store, events, snapshot)
+		return
+	}
+
+	// 降级：无 agentExecutor 时返回占位结果
+	select {
+	case <-ctx.Done():
+		dm.mu.Lock()
+		if task.Status != StatusCancelled {
+			task.Status = StatusFailed
+			task.Error = "timeout"
+			task.CompletedAt = time.Now()
+		}
+		snapshot := cloneDelegateTask(task)
+		dm.mu.Unlock()
+		dm.recordDelegateTaskFinished(store, events, snapshot)
+		return
+	default:
+	}
+
+	dm.mu.Lock()
+	if task.Status != StatusCancelled {
+		task.Status = StatusCompleted
+		task.Result = fmt.Sprintf("Sub-agent task completed (no executor): %s", description)
+		task.CompletedAt = time.Now()
+	}
+	snapshot := cloneDelegateTask(task)
+	dm.mu.Unlock()
+	dm.recordDelegateTaskFinished(store, events, snapshot)
+}
+
+// HandleStatus 处理状态查询
+func (dm *DelegateManager) HandleStatus(args map[string]any) (string, error) {
+	return dm.HandleStatusForSession(args, "")
+}
+
+func (dm *DelegateManager) HandleStatusForSession(args map[string]any, sessionID string) (string, error) {
+	taskID, ok := args["task_id"].(string)
+	taskID = strings.TrimSpace(taskID)
+	if !ok || taskID == "" {
+		return "", fmt.Errorf("task_id is required")
+	}
+	if err := dm.authorizeTaskSession(taskID, sessionID); err != nil {
+		return "", err
+	}
+	includeResult := delegateBoolArg(args, "include_result", true)
+	includeEvents := delegateBoolArg(args, "include_events", false)
+	includeTrace := delegateBoolArg(args, "include_trace", false)
+
+	dm.mu.RLock()
+	task, ok := dm.tasks[taskID]
+	snapshot := cloneDelegateTask(task)
+	store := dm.taskStore
+	dm.mu.RUnlock()
+
+	if !ok {
+		if store != nil {
+			return dm.handleUnifiedStatus(store, taskID, includeResult, includeEvents, includeTrace)
+		}
+		return "", fmt.Errorf("task not found: %s", taskID)
+	}
+
+	summary, inline, resultBytes, truncated := summarizeDelegateResult(snapshot.Result, dm.config.MaxResultBytesInline)
+	mode := snapshot.Mode
+	if mode == "" {
+		mode = taskstore.ModeSingle
+	}
+	resp := StatusResponse{
+		TaskID:             snapshot.ID,
+		ExecutionSessionID: snapshot.ExecutionSessionID,
+		ParentSessionID:    snapshot.ParentSessionID,
+		Role:               snapshot.Role,
+		Source:             string(taskstore.SourceTool),
+		Mode:               string(mode),
+		Description:        snapshot.Description,
+		Workspace:          snapshot.Workspace,
+		Status:             snapshot.Status.String(),
+		ResultSummary:      summary,
+		ResultBytes:        resultBytes,
+		ResultTruncated:    truncated,
+		Error:              snapshot.Error,
+		StartedAt:          snapshot.StartedAt.Format(time.RFC3339),
+		CompletedAt:        formatDelegateCompletedAt(snapshot.CompletedAt),
+		ToolCalls:          snapshot.ToolCalls,
+		ElapsedMS:          delegateElapsedMillis(snapshot.StartedAt, snapshot.CompletedAt),
+		LastTool:           snapshot.LastTool,
+	}
+	if includeResult {
+		resp.Result = inline
+	}
+	if store != nil && includeEvents {
+		if record, ok, err := store.Get(snapshot.ID); err == nil && ok {
+			events, _ := store.Events(snapshot.ID)
+			obs := taskstore.ReduceObservation(record, events)
+			resp.Observation = &obs
+			resp.Events = events
+		}
+	}
+	if store != nil && includeTrace {
+		if trace, ok, err := store.PlannerTrace(snapshot.ID); err == nil && ok {
+			resp.PlannerTrace = json.RawMessage(trace)
+		}
+	}
+	result, _ := json.Marshal(resp)
+
+	return string(result), nil
+}
+
+func delegateTaskIDsArg(args map[string]any) ([]string, error) {
+	if args == nil {
+		return nil, fmt.Errorf("task_ids is required")
+	}
+	raw, ok := args["task_ids"]
+	if !ok {
+		return nil, fmt.Errorf("task_ids is required")
+	}
+	var values []string
+	switch v := raw.(type) {
+	case []string:
+		values = append(values, v...)
+	case []any:
+		for _, item := range v {
+			id, ok := item.(string)
+			if !ok {
+				return nil, fmt.Errorf("task_ids must contain only strings")
+			}
+			values = append(values, id)
+		}
+	default:
+		return nil, fmt.Errorf("task_ids must be an array of task IDs")
+	}
+	seen := make(map[string]struct{}, len(values))
+	ids := make([]string, 0, len(values))
+	for _, value := range values {
+		id := strings.TrimSpace(value)
+		if id == "" {
+			return nil, fmt.Errorf("task_ids must not contain empty IDs")
+		}
+		if _, ok := seen[id]; ok {
+			continue
+		}
+		seen[id] = struct{}{}
+		ids = append(ids, id)
+	}
+	if len(ids) == 0 {
+		return nil, fmt.Errorf("task_ids must contain at least one task ID")
+	}
+	if len(ids) > maxWaitTaskIDs {
+		return nil, fmt.Errorf("task_ids supports at most %d task IDs", maxWaitTaskIDs)
+	}
+	return ids, nil
+}
+
+func (dm *DelegateManager) waitTimeoutFromArgs(args map[string]any) time.Duration {
+	timeout := dm.config.Timeout
+	if raw, ok := args["timeout"]; ok {
+		if requested, ok := delegateDurationSecondsArg(raw); ok {
+			timeout = requested
+		}
+	}
+	if timeout < minWaitTimeout {
+		timeout = minWaitTimeout
+	}
+	if timeout > dm.config.MaxTimeout {
+		timeout = dm.config.MaxTimeout
+	}
+	return timeout
+}
+
+func waitPollIntervalFromArgs(args map[string]any) time.Duration {
+	interval := DefaultWaitPollInterval
+	if n, ok := delegateIntArg(args["poll_interval_ms"]); ok {
+		interval = time.Duration(n) * time.Millisecond
+	}
+	if interval < minWaitPollInterval {
+		return minWaitPollInterval
+	}
+	if interval > maxWaitPollInterval {
+		return maxWaitPollInterval
+	}
+	return interval
+}
+
+func (dm *DelegateManager) waitTaskStatuses(taskIDs []string, includeResult bool) ([]StatusResponse, []string, error) {
+	return dm.waitTaskStatusesForSession(taskIDs, includeResult, "")
+}
+
+func (dm *DelegateManager) waitTaskStatusesForSession(taskIDs []string, includeResult bool, sessionID string) ([]StatusResponse, []string, error) {
+	statuses := make([]StatusResponse, 0, len(taskIDs))
+	pending := make([]string, 0, len(taskIDs))
+	for _, taskID := range taskIDs {
+		statusJSON, err := dm.HandleStatusForSession(map[string]any{
+			"task_id":        taskID,
+			"include_result": includeResult,
+		}, sessionID)
+		if err != nil {
+			return nil, nil, err
+		}
+		var status StatusResponse
+		if err := json.Unmarshal([]byte(statusJSON), &status); err != nil {
+			return nil, nil, fmt.Errorf("decode task status %q: %w", taskID, err)
+		}
+		statuses = append(statuses, status)
+		if !isTerminalDelegateStatus(status.Status) {
+			pending = append(pending, taskID)
+		}
+	}
+	return statuses, pending, nil
+}
+
+func marshalWaitResponse(tasks []StatusResponse, pending []string, timedOut bool, started time.Time) (string, error) {
+	response, err := json.Marshal(WaitResponse{
+		Tasks:          tasks,
+		AllTerminal:    len(pending) == 0,
+		TimedOut:       timedOut,
+		PendingTaskIDs: pending,
+		ElapsedMS:      time.Since(started).Milliseconds(),
+	})
+	if err != nil {
+		return "", err
+	}
+	return string(response), nil
+}
+
+func (dm *DelegateManager) HandleWaitForTasks(ctx context.Context, args map[string]any) (string, error) {
+	return dm.HandleWaitForTasksForSession(ctx, args, "")
+}
+
+func (dm *DelegateManager) HandleWaitForTasksForSession(ctx context.Context, args map[string]any, sessionID string) (string, error) {
+	taskIDs, err := delegateTaskIDsArg(args)
+	if err != nil {
+		return "", err
+	}
+	for _, taskID := range taskIDs {
+		if err := dm.authorizeTaskSession(taskID, sessionID); err != nil {
+			return "", err
+		}
+	}
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	timeout := dm.waitTimeoutFromArgs(args)
+	pollInterval := waitPollIntervalFromArgs(args)
+	includeResult := delegateBoolArg(args, "include_result", true)
+	started := time.Now()
+	waitCtx, cancel := context.WithTimeout(ctx, timeout)
+	defer cancel()
+	ticker := time.NewTicker(pollInterval)
+	defer ticker.Stop()
+
+	for {
+		statuses, pending, err := dm.waitTaskStatusesForSession(taskIDs, includeResult, sessionID)
+		if err != nil {
+			return "", err
+		}
+		if len(pending) == 0 {
+			return marshalWaitResponse(statuses, pending, false, started)
+		}
+
+		select {
+		case <-waitCtx.Done():
+			if time.Since(started) >= timeout {
+				statuses, pending, err = dm.waitTaskStatusesForSession(taskIDs, includeResult, sessionID)
+				if err != nil {
+					return "", err
+				}
+				return marshalWaitResponse(statuses, pending, len(pending) > 0, started)
+			}
+			return "", fmt.Errorf("wait for delegated tasks cancelled: %w", waitCtx.Err())
+		case <-ticker.C:
+		}
+	}
+}
+
+func (dm *DelegateManager) authorizeTaskSession(taskID string, sessionID string) error {
+	sessionID = strings.TrimSpace(sessionID)
+	if sessionID == "" {
+		return nil
+	}
+	dm.mu.RLock()
+	task, found := dm.tasks[taskID]
+	store := dm.taskStore
+	if found && task != nil {
+		owner := strings.TrimSpace(task.OwnerSessionID)
+		dm.mu.RUnlock()
+		if owner == sessionID {
+			return nil
+		}
+		return fmt.Errorf("task is not available in the current session")
+	}
+	dm.mu.RUnlock()
+	if store == nil {
+		return fmt.Errorf("task is not available in the current session")
+	}
+	record, ok, err := store.Get(taskID)
+	if err != nil {
+		return err
+	}
+	if !ok || strings.TrimSpace(record.Metadata["owner_session_id"]) != sessionID {
+		return fmt.Errorf("task is not available in the current session")
+	}
+	return nil
+}
+
+func (dm *DelegateManager) handleUnifiedStatus(store taskstore.Store, taskID string, includeResult bool, includeEvents bool, includeTrace bool) (string, error) {
+	record, ok, err := store.Get(taskID)
+	if err != nil {
+		return "", err
+	}
+	if !ok {
+		return "", fmt.Errorf("task not found: %s", taskID)
+	}
+	resultText, _, _ := store.Result(taskID)
+	summary, inline, resultBytes, truncated := summarizeDelegateResult(resultText, dm.config.MaxResultBytesInline)
+	executionSessionID, parentSessionID, role := recordExecutionRefs(record)
+	resp := StatusResponse{
+		TaskID:             record.ID,
+		ExecutionSessionID: executionSessionID,
+		ParentSessionID:    parentSessionID,
+		Role:               role,
+		Source:             string(record.Source),
+		Mode:               string(record.Mode),
+		ParentID:           record.ParentID,
+		Description:        record.Description,
+		Workspace:          record.Runtime.Workspace,
+		Status:             string(record.Status),
+		ResultSummary:      summary,
+		ResultBytes:        resultBytes,
+		ResultTruncated:    truncated,
+		StartedAt:          formatDelegateCompletedAt(record.StartedAt),
+		CompletedAt:        formatDelegateCompletedAt(record.CompletedAt),
+		ToolCalls:          record.Outcome.Cost.ToolCalls,
+		ElapsedMS:          delegateElapsedMillis(record.StartedAt, record.CompletedAt),
+		LastTool:           record.Metadata["last_tool"],
+	}
+	if includeResult {
+		resp.Result = inline
+	}
+	if includeEvents {
+		events, _ := store.Events(taskID)
+		obs := taskstore.ReduceObservation(record, events)
+		resp.Observation = &obs
+		resp.Events = events
+	}
+	if includeTrace {
+		if trace, ok, err := store.PlannerTrace(taskID); err == nil && ok {
+			resp.PlannerTrace = json.RawMessage(trace)
+		}
+	}
+	out, _ := json.Marshal(resp)
+	return string(out), nil
+}
+
+// HandleList 处理任务列表
+func (dm *DelegateManager) HandleList(args map[string]any) (string, error) {
+	return dm.HandleListForSession(args, "")
+}
+
+func (dm *DelegateManager) HandleListForSession(args map[string]any, sessionID string) (string, error) {
+	sessionID = strings.TrimSpace(sessionID)
+	statusFilter := strings.ToLower(strings.TrimSpace(delegateStringArg(args, "status")))
+	if statusFilter != "" && !isValidDelegateStatus(statusFilter) {
+		return "", fmt.Errorf("unsupported status filter %q", statusFilter)
+	}
+	limit := DefaultListLimit
+	if n, ok := delegateIntArg(args["limit"]); ok {
+		limit = n
+	}
+	if limit <= 0 {
+		limit = DefaultListLimit
+	}
+	if limit > maxDelegateListLimit {
+		limit = maxDelegateListLimit
+	}
+	order := strings.ToLower(strings.TrimSpace(delegateStringArg(args, "order")))
+	if order == "" {
+		order = "desc"
+	}
+	if order != "asc" && order != "desc" {
+		return "", fmt.Errorf("unsupported order %q (expected asc or desc)", order)
+	}
+	includeResult := delegateBoolArg(args, "include_result", false)
+	sourceFilter := strings.ToLower(strings.TrimSpace(delegateStringArg(args, "source")))
+
+	dm.mu.RLock()
+	snapshots := make([]DelegateTask, 0, len(dm.tasks))
+	seenIDs := make(map[string]struct{}, len(dm.tasks))
+	for _, t := range dm.tasks {
+		snapshots = append(snapshots, cloneDelegateTask(t))
+		seenIDs[t.ID] = struct{}{}
+	}
+	store := dm.taskStore
+	dm.mu.RUnlock()
+
+	byStatus := map[string]int{
+		StatusPending.String():   0,
+		StatusRunning.String():   0,
+		StatusCompleted.String(): 0,
+		StatusFailed.String():    0,
+		StatusCancelled.String(): 0,
+	}
+	filtered := make([]DelegateTask, 0, len(snapshots))
+	for _, t := range snapshots {
+		if sessionID != "" && strings.TrimSpace(t.OwnerSessionID) != sessionID {
+			continue
+		}
+		status := t.Status.String()
+		byStatus[status]++
+		if sourceFilter != "" && sourceFilter != string(taskstore.SourceTool) {
+			continue
+		}
+		if statusFilter != "" && status != statusFilter {
+			continue
+		}
+		filtered = append(filtered, t)
+	}
+
+	sort.SliceStable(filtered, func(i, j int) bool {
+		if filtered[i].StartedAt.Equal(filtered[j].StartedAt) {
+			if order == "asc" {
+				return filtered[i].ID < filtered[j].ID
+			}
+			return filtered[i].ID > filtered[j].ID
+		}
+		if order == "asc" {
+			return filtered[i].StartedAt.Before(filtered[j].StartedAt)
+		}
+		return filtered[i].StartedAt.After(filtered[j].StartedAt)
+	})
+	total := len(filtered)
+	if len(filtered) > limit {
+		filtered = filtered[:limit]
+	}
+
+	items := make([]ListItem, 0, len(filtered))
+	for _, t := range filtered {
+		summary, _, resultBytes, truncated := summarizeDelegateResult(t.Result, dm.config.MaxResultBytesInline)
+		mode := t.Mode
+		if mode == "" {
+			mode = taskstore.ModeSingle
+		}
+		item := ListItem{
+			TaskID:             t.ID,
+			ExecutionSessionID: t.ExecutionSessionID,
+			ParentSessionID:    t.ParentSessionID,
+			Role:               t.Role,
+			Source:             string(taskstore.SourceTool),
+			Mode:               string(mode),
+			Description:        t.Description,
+			Workspace:          t.Workspace,
+			Status:             t.Status.String(),
+			Error:              t.Error,
+			StartedAt:          t.StartedAt.Format(time.RFC3339),
+			CompletedAt:        formatDelegateCompletedAt(t.CompletedAt),
+			ToolCalls:          t.ToolCalls,
+			ElapsedMS:          delegateElapsedMillis(t.StartedAt, t.CompletedAt),
+			LastTool:           t.LastTool,
+		}
+		if includeResult {
+			item.ResultSummary = summary
+			item.ResultBytes = resultBytes
+			item.ResultTruncated = truncated
+		}
+		items = append(items, item)
+	}
+	if store != nil {
+		filter := taskstore.ListFilter{
+			Source: taskstore.Source(sourceFilter),
+			Status: taskstore.Status(statusFilter),
+			Limit:  maxDelegateListLimit,
+		}
+		records, err := store.List(filter)
+		if err == nil {
+			for _, record := range records {
+				if _, seen := seenIDs[record.ID]; seen {
+					continue
+				}
+				if sessionID != "" && strings.TrimSpace(record.Metadata["owner_session_id"]) != sessionID {
+					continue
+				}
+				resultText, _, _ := store.Result(record.ID)
+				summary, _, resultBytes, truncated := summarizeDelegateResult(resultText, dm.config.MaxResultBytesInline)
+				executionSessionID, parentSessionID, role := recordExecutionRefs(record)
+				item := ListItem{
+					TaskID:             record.ID,
+					ExecutionSessionID: executionSessionID,
+					ParentSessionID:    parentSessionID,
+					Role:               role,
+					Source:             string(record.Source),
+					Mode:               string(record.Mode),
+					ParentID:           record.ParentID,
+					Description:        record.Description,
+					Workspace:          record.Runtime.Workspace,
+					Status:             string(record.Status),
+					Error:              record.Outcome.UserFeedback,
+					StartedAt:          formatDelegateCompletedAt(record.StartedAt),
+					CompletedAt:        formatDelegateCompletedAt(record.CompletedAt),
+					ToolCalls:          record.Outcome.Cost.ToolCalls,
+					ElapsedMS:          delegateElapsedMillis(record.StartedAt, record.CompletedAt),
+					LastTool:           record.Metadata["last_tool"],
+				}
+				if includeResult {
+					item.ResultSummary = summary
+					item.ResultBytes = resultBytes
+					item.ResultTruncated = truncated
+				}
+				items = append(items, item)
+				total++
+				byStatus[string(record.Status)]++
+			}
+		}
+	}
+	sort.SliceStable(items, func(i, j int) bool {
+		if items[i].StartedAt == items[j].StartedAt {
+			if order == "asc" {
+				return items[i].TaskID < items[j].TaskID
+			}
+			return items[i].TaskID > items[j].TaskID
+		}
+		if order == "asc" {
+			return items[i].StartedAt < items[j].StartedAt
+		}
+		return items[i].StartedAt > items[j].StartedAt
+	})
+	if len(items) > limit {
+		items = items[:limit]
+	}
+
+	result, _ := json.Marshal(ListResponse{
+		Tasks:    items,
+		Count:    len(items),
+		Total:    total,
+		ByStatus: byStatus,
+	})
+
+	return string(result), nil
+}
+
+func (dm *DelegateManager) HandleCancel(args map[string]any) (string, error) {
+	return dm.HandleCancelForSession(args, "")
+}
+
+func (dm *DelegateManager) HandleCancelForSession(args map[string]any, sessionID string) (string, error) {
+	taskID, ok := args["task_id"].(string)
+	taskID = strings.TrimSpace(taskID)
+	if !ok || taskID == "" {
+		return "", fmt.Errorf("task_id is required")
+	}
+	if err := dm.authorizeTaskSession(taskID, sessionID); err != nil {
+		return "", err
+	}
+	reason := strings.TrimSpace(delegateStringArg(args, "reason"))
+	if reason == "" {
+		reason = "cancelled by user"
+	}
+	if err := dm.CancelTask(taskID, reason); err != nil {
+		return "", err
+	}
+
+	result, _ := json.Marshal(CancelResponse{
+		TaskID:  taskID,
+		Status:  StatusCancelled.String(),
+		Message: fmt.Sprintf("Task '%s' cancelled.", taskID),
+	})
+	return string(result), nil
+}
+
+// CancelTask stops a running delegated task and persists its cancellation.
+// HTTP task APIs use this method so cancellation has the same behavior as the
+// delegate_cancel tool.
+func (dm *DelegateManager) CancelTask(taskID, reason string) error {
+	taskID = strings.TrimSpace(taskID)
+	if taskID == "" {
+		return fmt.Errorf("task_id is required")
+	}
+	if reason = strings.TrimSpace(reason); reason == "" {
+		reason = "cancelled by user"
+	}
+
+	dm.mu.Lock()
+	task, ok := dm.tasks[taskID]
+	if !ok {
+		dm.mu.Unlock()
+		return fmt.Errorf("task not found: %s", taskID)
+	}
+	switch task.Status {
+	case StatusCompleted, StatusFailed, StatusCancelled:
+		status := task.Status.String()
+		dm.mu.Unlock()
+		return fmt.Errorf("task %s cannot be cancelled from status %s", taskID, status)
+	}
+	task.Status = StatusCancelled
+	task.Error = reason
+	task.CompletedAt = time.Now()
+	cancel := dm.cancels[taskID]
+	store := dm.taskStore
+	events := dm.taskEvents
+	snapshot := cloneDelegateTask(task)
+	dm.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	dm.recordDelegateTaskFinished(store, events, snapshot)
+	return nil
+}
+
+func (dm *DelegateManager) recordDelegateTaskCreated(store taskstore.Store, events *taskstore.EventBus, task *DelegateTask, timeout time.Duration, maxChildren int, allowRecursive bool, plannerTrace any) {
+	if store == nil || events == nil || task == nil {
+		return
+	}
+	mode := task.Mode
+	if mode == "" {
+		mode = taskstore.ModeSingle
+	}
+	record := taskstore.Record{
+		ID:                 task.ID,
+		ExecutionSessionID: task.ExecutionSessionID,
+		ParentSessionID:    task.ParentSessionID,
+		Role:               task.Role,
+		Source:             taskstore.SourceTool,
+		Mode:               mode,
+		Status:             taskstore.StatusPending,
+		Description:        task.Description,
+		Input:              task.Context,
+		CreatedAt:          task.StartedAt,
+		Runtime: taskstore.RuntimeRef{
+			Type:      "delegate",
+			Workspace: task.Workspace,
+		},
+		Budget: taskstore.Budget{
+			Timeout:        timeout,
+			MaxChildren:    maxChildren,
+			MaxConcurrent:  dm.config.MaxConcurrent,
+			AllowRecursive: allowRecursive,
+		},
+		Metadata: map[string]string{
+			"planned_mode":         string(task.PlannedMode),
+			"planner_summary":      task.PlannerSummary,
+			"owner_session_id":     task.OwnerSessionID,
+			"owner_source":         task.OwnerSource,
+			"request_key":          task.RequestKey,
+			"execution_session_id": task.ExecutionSessionID,
+			"parent_session_id":    task.ParentSessionID,
+			"role":                 task.Role,
+		},
+	}
+	if _, err := store.Create(record); err != nil {
+		return
+	}
+	_ = events.Created(record)
+	if plannerTrace != nil {
+		_ = store.SavePlannerTrace(task.ID, plannerTrace)
+		_ = events.Emit(taskstore.Event{
+			Type:    taskstore.EventPlanned,
+			TaskID:  task.ID,
+			Status:  taskstore.StatusPending,
+			Mode:    mode,
+			Message: task.PlannerSummary,
+			Metadata: map[string]string{
+				"planned_mode": string(task.PlannedMode),
+			},
+		})
+	}
+}
+
+func (dm *DelegateManager) recordDelegateTaskStarted(store taskstore.Store, events *taskstore.EventBus, task *DelegateTask) {
+	if store == nil || events == nil || task == nil {
+		return
+	}
+	record, ok, err := store.Get(task.ID)
+	if err != nil || !ok {
+		return
+	}
+	record.Status = taskstore.StatusRunning
+	record.StartedAt = task.StartedAt
+	if err := store.Update(record); err != nil {
+		return
+	}
+	_ = events.Started(record)
+}
+
+func (dm *DelegateManager) recordDelegateTaskFinished(store taskstore.Store, events *taskstore.EventBus, task DelegateTask) {
+	if store == nil || events == nil || strings.TrimSpace(task.ID) == "" {
+		return
+	}
+	record, ok, err := store.Get(task.ID)
+	if err != nil || !ok {
+		return
+	}
+	record.Status = delegateStatusToUnified(task.Status)
+	record.CompletedAt = task.CompletedAt
+	record.Outcome.Status = record.Status
+	if task.ToolCalls > 0 {
+		record.Outcome.Cost.ToolCalls = task.ToolCalls
+	}
+	if !task.StartedAt.IsZero() && !task.CompletedAt.IsZero() && task.CompletedAt.After(task.StartedAt) {
+		record.Outcome.Cost.Elapsed = task.CompletedAt.Sub(task.StartedAt)
+	}
+	if strings.TrimSpace(task.LastTool) != "" {
+		if record.Metadata == nil {
+			record.Metadata = make(map[string]string)
+		}
+		record.Metadata["last_tool"] = task.LastTool
+	}
+	if task.Error != "" {
+		record.Outcome.UserFeedback = task.Error
+	}
+	switch task.Status {
+	case StatusCompleted:
+		_ = store.SaveResult(task.ID, task.Result)
+		_ = events.Completed(record, "delegate task completed")
+	case StatusFailed:
+		_ = events.Failed(record, task.Error)
+	case StatusCancelled:
+		_ = events.Emit(taskstore.Event{
+			Type:               taskstore.EventCancelled,
+			TaskID:             task.ID,
+			ExecutionSessionID: task.ExecutionSessionID,
+			ParentSessionID:    task.ParentSessionID,
+			Role:               task.Role,
+			Mode:               task.Mode,
+			Status:             taskstore.StatusCancelled,
+			Message:            task.Error,
+		})
+	}
+	// A terminal record is only visible after its result and terminal event are
+	// durable. This prevents readers from observing "completed" while a worker
+	// still writes task artifacts.
+	if err := store.Update(record); err != nil {
+		return
+	}
+}
+
+func delegateStatusToUnified(status TaskStatus) taskstore.Status {
+	switch status {
+	case StatusPending:
+		return taskstore.StatusPending
+	case StatusRunning:
+		return taskstore.StatusRunning
+	case StatusCompleted:
+		return taskstore.StatusCompleted
+	case StatusFailed:
+		return taskstore.StatusFailed
+	case StatusCancelled:
+		return taskstore.StatusCancelled
+	default:
+		return ""
+	}
+}
+
+// ParallelDelegateTask 并行委派任务
+type ParallelDelegateTask struct {
+	ID          string
+	Description string
+	Context     string
+	Status      TaskStatus
+	Result      string
+	Error       string
+	StartedAt   time.Time
+	CompletedAt time.Time
+}
+
+// ParallelDelegateResult 并行委派结果
+type ParallelDelegateResult struct {
+	Results       []string // 各子代理结果
+	Summary       string   // 汇总摘要
+	FailedCount   int      // 失败任务数
+	SuccessCount  int      // 成功任务数
+	TotalDuration time.Duration
+}
+
+// DelegateParallel 并行委派多个任务
+// 支持多个子代理并行执行任务，结果汇总
+func (dm *DelegateManager) DelegateParallel(descriptions []string, contextStr string, timeout time.Duration) *ParallelDelegateResult {
+	if len(descriptions) == 0 {
+		return &ParallelDelegateResult{
+			Summary: "No tasks to delegate",
+		}
+	}
+
+	// 限制并发数
+	maxConcurrent := dm.config.MaxConcurrent
+	if maxConcurrent <= 0 {
+		maxConcurrent = 3
+	}
+
+	startTime := time.Now()
+	resultCh := make(chan struct {
+		index  int
+		result string
+		err    error
+	}, len(descriptions))
+
+	// 信号量控制并发
+	sem := make(chan struct{}, maxConcurrent)
+
+	// 启动所有任务
+	for i, desc := range descriptions {
+		go func(idx int, description string) {
+			sem <- struct{}{}        // 获取信号量
+			defer func() { <-sem }() // 释放信号量
+
+			// 创建任务
+			dm.mu.Lock()
+			dm.nextID++
+			taskID := fmt.Sprintf("parallel-task-%d-%d", time.Now().UnixNano(), dm.nextID)
+			workspace, enrichedContext, workspaceErr := prepareDelegateExecutionContext(taskID, description, contextStr, dm.workspacePolicy)
+			task := &DelegateTask{
+				ID:          taskID,
+				Description: description,
+				Context:     contextStr,
+				Workspace:   workspace,
+				Status:      StatusPending,
+				StartedAt:   time.Now(),
+			}
+			dm.tasks[taskID] = task
+			dm.mu.Unlock()
+
+			// 执行任务
+			ctx, cancel := context.WithTimeout(context.Background(), timeout)
+			defer cancel()
+
+			var result string
+			var err error
+
+			if workspaceErr != nil {
+				err = workspaceErr
+			} else {
+				dm.mu.RLock()
+				executor := dm.agentExecutor
+				executorWithOptions := dm.agentExecutorWithOptions
+				dm.mu.RUnlock()
+				if executorWithOptions != nil {
+					result, err = executorWithOptions(ctx, description, enrichedContext, AgentExecutorOptions{})
+				} else if executor != nil {
+					result, err = executor(ctx, description, enrichedContext)
+				} else {
+					result = fmt.Sprintf("Sub-agent task completed (no executor): %s", description)
+				}
+			}
+
+			// 更新任务状态
+			dm.mu.Lock()
+			if err != nil {
+				task.Status = StatusFailed
+				task.Error = err.Error()
+			} else {
+				task.Status = StatusCompleted
+				task.Result = result
+			}
+			task.CompletedAt = time.Now()
+			dm.mu.Unlock()
+
+			resultCh <- struct {
+				index  int
+				result string
+				err    error
+			}{index: i, result: result, err: err}
+		}(i, desc)
+	}
+
+	// 收集所有结果
+	results := make([]string, len(descriptions))
+	var successCount, failedCount int
+
+	for i := 0; i < len(descriptions); i++ {
+		r := <-resultCh
+		results[r.index] = r.result
+		if r.err != nil {
+			failedCount++
+		} else {
+			successCount++
+		}
+	}
+
+	totalDuration := time.Since(startTime)
+
+	// 生成汇总摘要
+	summary := dm.generateParallelSummary(descriptions, results, successCount, failedCount)
+
+	return &ParallelDelegateResult{
+		Results:       results,
+		Summary:       summary,
+		FailedCount:   failedCount,
+		SuccessCount:  successCount,
+		TotalDuration: totalDuration,
+	}
+}
+
+// generateParallelSummary 生成并行任务汇总摘要
+func (dm *DelegateManager) generateParallelSummary(descriptions, results []string, successCount, failedCount int) string {
+	var sb strings.Builder
+	sb.WriteString(fmt.Sprintf("Parallel Delegation Summary:\n"))
+	sb.WriteString(fmt.Sprintf("- Total Tasks: %d\n", len(descriptions)))
+	sb.WriteString(fmt.Sprintf("- Successful: %d\n", successCount))
+	sb.WriteString(fmt.Sprintf("- Failed: %d\n", failedCount))
+	sb.WriteString("\n")
+
+	for i, desc := range descriptions {
+		status := "✅"
+		result := results[i]
+		if len(result) > 200 {
+			result = result[:200] + "..."
+		}
+		// 简单判断是否失败（包含 error 关键词）
+		if strings.Contains(strings.ToLower(result), "error") ||
+			strings.Contains(strings.ToLower(result), "failed") {
+			status = "❌"
+		}
+		sb.WriteString(fmt.Sprintf("%s Task %d: %s\n", status, i+1, desc))
+		sb.WriteString(fmt.Sprintf("   Result: %s\n\n", result))
+	}
+
+	return sb.String()
+}
+
+// HandleDelegateParallel 处理并行委派请求
+func (dm *DelegateManager) HandleDelegateParallel(args map[string]any) (string, error) {
+	// 解析 tasks 数组
+	tasksArg, ok := args["tasks"].([]any)
+	if !ok {
+		return "", fmt.Errorf("tasks array is required")
+	}
+
+	var descriptions []string
+	for _, t := range tasksArg {
+		if desc, ok := t.(string); ok {
+			descriptions = append(descriptions, desc)
+		}
+	}
+
+	if len(descriptions) == 0 {
+		return "", fmt.Errorf("at least one task description is required")
+	}
+
+	contextStr := ""
+	if c, ok := args["context"]; ok {
+		contextStr, _ = c.(string)
+	}
+
+	timeout := 120
+	if t, ok := args["timeout"]; ok {
+		switch v := t.(type) {
+		case float64:
+			timeout = int(v)
+		case int:
+			timeout = v
+		}
+	}
+
+	// 执行并行委派
+	result := dm.DelegateParallel(descriptions, contextStr, time.Duration(timeout)*time.Second)
+
+	// 返回结果
+	response := map[string]any{
+		"success_count": result.SuccessCount,
+		"failed_count":  result.FailedCount,
+		"duration_sec":  result.TotalDuration.Seconds(),
+		"summary":       result.Summary,
+		"results":       result.Results,
+	}
+
+	data, err := json.Marshal(response)
+	if err != nil {
+		return "", err
+	}
+
+	return string(data), nil
+}

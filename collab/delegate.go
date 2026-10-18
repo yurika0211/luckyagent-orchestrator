@@ -1,0 +1,1447 @@
+package collab
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+	"fmt"
+	"os"
+	"strconv"
+	"strings"
+	"sync"
+	"time"
+
+	taskstore "github.com/yurika0211/luckyagent-orchestrator/task"
+)
+
+// TaskState 协作任务状态
+type TaskState string
+
+const (
+	TaskPending   TaskState = "pending"
+	TaskRunning   TaskState = "running"
+	TaskCompleted TaskState = "completed"
+	TaskFailed    TaskState = "failed"
+	TaskCancelled TaskState = "cancelled"
+	TaskTimeout   TaskState = "timeout"
+)
+
+const runtimeConstraintMarker = "LuckyAgent runtime constraints:"
+
+// SubTask 子任务
+type SubTask struct {
+	ID                 string              `json:"id"`
+	ParentID           string              `json:"parent_id"`
+	ExecutionSessionID string              `json:"execution_session_id,omitempty"`
+	ParentSessionID    string              `json:"parent_session_id,omitempty"`
+	Role               string              `json:"role,omitempty"`
+	AgentID            string              `json:"agent_id"` // 被委派的 Agent
+	Description        string              `json:"description"`
+	Input              string              `json:"input"`  // 子任务输入
+	Output             string              `json:"output"` // 子任务输出
+	State              TaskState           `json:"state"`
+	Error              string              `json:"error,omitempty"`
+	Runtime            AgentRuntimeProfile `json:"runtime,omitempty"`
+	StartedAt          time.Time           `json:"started_at"`
+	CompletedAt        time.Time           `json:"completed_at,omitempty"`
+	Timeout            time.Duration       `json:"timeout"`
+}
+
+// CollabTask 协作任务（包含多个子任务）
+type CollabTask struct {
+	ID                 string            `json:"id"`
+	ExecutionSessionID string            `json:"execution_session_id,omitempty"`
+	ParentSessionID    string            `json:"parent_session_id,omitempty"`
+	Role               string            `json:"role,omitempty"`
+	Mode               CollabMode        `json:"mode"` // 协作模式
+	Description        string            `json:"description"`
+	Input              string            `json:"input"`
+	SubTasks           []*SubTask        `json:"sub_tasks"`
+	State              TaskState         `json:"state"`
+	Result             string            `json:"result,omitempty"`
+	CreatedAt          time.Time         `json:"created_at"`
+	CompletedAt        time.Time         `json:"completed_at,omitempty"`
+	Timeout            time.Duration     `json:"timeout"`
+	Metadata           map[string]string `json:"metadata,omitempty"`
+}
+
+// DelegateManager 协作任务委派管理器
+type DelegateManager struct {
+	mu         sync.RWMutex
+	registry   *Registry
+	tasks      map[string]*CollabTask
+	nextID     int
+	handler    TaskHandler // 子任务执行处理器
+	planner    *Planner
+	taskStore  taskstore.Store
+	taskEvents *taskstore.EventBus
+	policy     *taskstore.Policy
+	mdpPath    string
+	blackboard *Blackboard
+	messageBus *MessageBus
+	cancels    map[string]context.CancelFunc
+}
+
+// TaskHandler 子任务执行处理器接口
+type TaskHandler interface {
+	HandleSubTask(ctx context.Context, task *SubTask) (string, error)
+}
+
+// SubTaskVerifier is an optional extension for handlers that can validate a
+// subtask output before the orchestration policy accepts it.
+type SubTaskVerifier interface {
+	VerifySubTask(ctx context.Context, task *SubTask, output string) error
+}
+
+// TaskHandlerFunc 函数式 TaskHandler
+type TaskHandlerFunc func(ctx context.Context, task *SubTask) (string, error)
+
+func (f TaskHandlerFunc) HandleSubTask(ctx context.Context, task *SubTask) (string, error) {
+	return f(ctx, task)
+}
+
+// NewDelegateManager 创建委派管理器
+func NewDelegateManager(registry *Registry, handler TaskHandler) *DelegateManager {
+	return &DelegateManager{
+		registry:   registry,
+		tasks:      make(map[string]*CollabTask),
+		handler:    handler,
+		planner:    NewPlanner(nil),
+		blackboard: NewBlackboard(),
+		messageBus: NewMessageBus(2000),
+		cancels:    make(map[string]context.CancelFunc),
+	}
+}
+
+// Blackboard returns the shared task collaboration board.
+func (dm *DelegateManager) Blackboard() *Blackboard {
+	if dm == nil {
+		return nil
+	}
+	dm.mu.RLock()
+	board := dm.blackboard
+	dm.mu.RUnlock()
+	return board
+}
+
+// MessageBus returns the in-process A2A mailbox for this runtime.
+func (dm *DelegateManager) MessageBus() *MessageBus {
+	if dm == nil {
+		return nil
+	}
+	dm.mu.RLock()
+	bus := dm.messageBus
+	dm.mu.RUnlock()
+	return bus
+}
+
+// SetPlanner replaces the default Dijkstra/Markov planner.
+func (dm *DelegateManager) SetPlanner(planner *Planner) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	if planner == nil {
+		planner = NewPlanner(nil)
+	}
+	dm.planner = planner
+}
+
+func (dm *DelegateManager) SetTaskStore(store taskstore.Store) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.taskStore = store
+	if store == nil {
+		dm.taskEvents = nil
+		return
+	}
+	dm.taskEvents = taskstore.NewEventBus(store)
+}
+
+func (dm *DelegateManager) SetPolicy(policy taskstore.Policy) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	dm.policy = &policy
+}
+
+func (dm *DelegateManager) SetMDPSnapshotPath(path string) error {
+	path = strings.TrimSpace(path)
+	if path == "" {
+		return fmt.Errorf("mdp snapshot path is required")
+	}
+	dm.mu.Lock()
+	planner := dm.planner
+	dm.mdpPath = path
+	dm.mu.Unlock()
+	if planner == nil {
+		return nil
+	}
+	if err := planner.LoadMDP(path); err != nil && !errors.Is(err, os.ErrNotExist) {
+		return err
+	}
+	return nil
+}
+
+// Delegate creates and runs a collaboration task without a cost constraint.
+func (dm *DelegateManager) Delegate(ctx context.Context, mode CollabMode, description, input string, agentIDs []string, timeout time.Duration) (*CollabTask, error) {
+	return dm.delegate(ctx, mode, description, input, agentIDs, timeout, 0, "")
+}
+
+// DelegateWithCostBudget creates and runs a collaboration task with a
+// normalized planning budget. A zero budget leaves cost unconstrained; a
+// positive value guides auto mode toward lower-cost orchestration choices.
+func (dm *DelegateManager) DelegateWithCostBudget(ctx context.Context, mode CollabMode, description, input string, agentIDs []string, timeout time.Duration, costBudget float64) (*CollabTask, error) {
+	return dm.delegate(ctx, mode, description, input, agentIDs, timeout, costBudget, "")
+}
+
+// DelegateWithSession preserves the requesting chat session on a collaboration
+// task while keeping Delegate's backwards-compatible API.
+func (dm *DelegateManager) DelegateWithSession(ctx context.Context, mode CollabMode, description, input string, agentIDs []string, timeout time.Duration, costBudget float64, parentSessionID string) (*CollabTask, error) {
+	return dm.delegate(ctx, mode, description, input, agentIDs, timeout, costBudget, parentSessionID)
+}
+
+func (dm *DelegateManager) delegate(ctx context.Context, mode CollabMode, description, input string, agentIDs []string, timeout time.Duration, costBudget float64, parentSessionID string) (*CollabTask, error) {
+	if ctx == nil {
+		ctx = context.Background()
+	}
+	if len(agentIDs) == 0 {
+		return nil, fmt.Errorf("at least one agent ID is required")
+	}
+	if costBudget < 0 || costBudget > 1 {
+		return nil, fmt.Errorf("cost budget must be between 0 and 1")
+	}
+	parsedMode, err := ParseMode(string(mode))
+	if err != nil {
+		return nil, err
+	}
+	mode = parsedMode
+
+	dm.mu.RLock()
+	policy := dm.policy
+	dm.mu.RUnlock()
+	if policy != nil {
+		decision := taskstore.EvaluatePolicy(*policy, taskstore.PolicyRequest{
+			Source:        taskstore.SourceHTTP,
+			Mode:          collabModeToUnified(mode),
+			ChildCount:    len(agentIDs),
+			MaxConcurrent: len(agentIDs),
+			Timeout:       timeout,
+		})
+		if err := decision.Error(); err != nil {
+			return nil, err
+		}
+	}
+
+	dm.mu.Lock()
+	dm.nextID++
+	// The counter is only process-local. Include time so a restart cannot
+	// recreate collab-1 and attach a new run to an old persisted task/session.
+	taskID := fmt.Sprintf("collab-%d-%d", time.Now().UnixNano(), dm.nextID)
+
+	// 创建子任务
+	subTasks := make([]*SubTask, 0, len(agentIDs))
+	agents := make([]*AgentProfile, 0, len(agentIDs))
+	for i, agentID := range agentIDs {
+		// 验证 Agent 存在
+		profile, ok := dm.registry.Get(agentID)
+		if !ok {
+			dm.mu.Unlock()
+			return nil, fmt.Errorf("agent %s not found in registry", agentID)
+		}
+		agents = append(agents, profile)
+
+		subID := fmt.Sprintf("%s-sub-%d", taskID, i+1)
+		subTasks = append(subTasks, &SubTask{
+			ID:                 subID,
+			ParentID:           taskID,
+			ExecutionSessionID: "collab-" + subID,
+			ParentSessionID:    strings.TrimSpace(parentSessionID),
+			Role:               "subagent",
+			AgentID:            agentID,
+			Description:        description,
+			Input:              input,
+			State:              TaskPending,
+			Runtime:            profile.Runtime,
+			Timeout:            timeout,
+		})
+	}
+
+	var plan *PlanResult
+	planner := dm.planner
+	if mode == "" || mode == ModeAuto {
+		if planner == nil {
+			planner = NewPlanner(nil)
+			dm.planner = planner
+		}
+		result := planner.Plan(PlanRequest{
+			Description: description,
+			Input:       input,
+			AgentIDs:    append([]string(nil), agentIDs...),
+			Agents:      agents,
+			Timeout:     timeout,
+			CostBudget:  costBudget,
+		})
+		plan = &result
+		mode = result.Mode
+	}
+
+	task := &CollabTask{
+		ID:                 taskID,
+		ExecutionSessionID: "collab-" + taskID,
+		ParentSessionID:    strings.TrimSpace(parentSessionID),
+		Role:               "orchestrator",
+		Mode:               mode,
+		Description:        description,
+		Input:              input,
+		SubTasks:           subTasks,
+		State:              TaskPending,
+		CreatedAt:          time.Now(),
+		Timeout:            timeout,
+		Metadata:           make(map[string]string),
+	}
+	task.Metadata["cost_budget"] = fmt.Sprintf("%.4f", costBudget)
+	task.Metadata["execution_session_id"] = task.ExecutionSessionID
+	task.Metadata["parent_session_id"] = task.ParentSessionID
+	task.Metadata["role"] = task.Role
+	if plan != nil {
+		task.Metadata["planner"] = plan.Version
+		task.Metadata["planned_mode"] = string(plan.Mode)
+		task.Metadata["planner_path"] = fmt.Sprint(plan.Path)
+		task.Metadata["planner_weight"] = fmt.Sprintf("%.6f", plan.TotalWeight)
+		task.Metadata["mdp_version"] = plan.MDP.Version
+		task.Metadata["mdp_state"] = plan.MDP.StateKey
+		if summary := mdpDecisionSummary(plan.MDP); summary != "" {
+			task.Metadata["mdp_q_values"] = summary
+		}
+		if action, ok := plan.MDP.Actions[plan.Mode]; ok {
+			task.Metadata["mdp_action"] = action.Key()
+		}
+		if payload, err := json.Marshal(plan); err == nil {
+			task.Metadata["planner_trace"] = string(payload)
+		}
+	}
+
+	taskCtx, cancel := context.WithCancel(ctx)
+	dm.tasks[taskID] = task
+	dm.cancels[taskID] = cancel
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+
+	dm.recordCollabTaskCreated(store, events, task, plan)
+
+	// 根据模式执行
+	switch mode {
+	case ModePipeline:
+		go dm.executePipeline(taskCtx, task)
+	case ModeParallel:
+		go dm.executeParallel(taskCtx, task)
+	case ModeDebate:
+		go dm.executeDebate(taskCtx, task)
+	default:
+		go dm.executeParallel(taskCtx, task)
+	}
+
+	return task, nil
+}
+
+// GetTask 获取任务
+func (dm *DelegateManager) GetTask(taskID string) (*CollabTask, bool) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	t, ok := dm.tasks[taskID]
+	if !ok {
+		return nil, false
+	}
+	// 深拷贝，避免 data race
+	cp := *t
+	// 拷贝 SubTasks 切片
+	if t.SubTasks != nil {
+		cp.SubTasks = make([]*SubTask, len(t.SubTasks))
+		for i, sub := range t.SubTasks {
+			subCopy := *sub
+			cp.SubTasks[i] = &subCopy
+		}
+	}
+	// 拷贝 Metadata map
+	if t.Metadata != nil {
+		cp.Metadata = make(map[string]string, len(t.Metadata))
+		for k, v := range t.Metadata {
+			cp.Metadata[k] = v
+		}
+	}
+	return &cp, true
+}
+
+// ListTasks 列出所有任务
+func (dm *DelegateManager) ListTasks() []*CollabTask {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	result := make([]*CollabTask, 0, len(dm.tasks))
+	for _, t := range dm.tasks {
+		// 深拷贝，避免 data race
+		cp := *t
+		// 拷贝 SubTasks 切片
+		if t.SubTasks != nil {
+			cp.SubTasks = make([]*SubTask, len(t.SubTasks))
+			for i, sub := range t.SubTasks {
+				subCopy := *sub
+				cp.SubTasks[i] = &subCopy
+			}
+		}
+		// 拷贝 Metadata map
+		if t.Metadata != nil {
+			cp.Metadata = make(map[string]string, len(t.Metadata))
+			for k, v := range t.Metadata {
+				cp.Metadata[k] = v
+			}
+		}
+		result = append(result, &cp)
+	}
+	return result
+}
+
+// CancelTask 取消任务
+func (dm *DelegateManager) CancelTask(taskID string) error {
+	dm.mu.Lock()
+
+	task, ok := dm.tasks[taskID]
+	if !ok {
+		dm.mu.Unlock()
+		return fmt.Errorf("task %s not found", taskID)
+	}
+
+	if task.State == TaskCompleted || task.State == TaskFailed || task.State == TaskTimeout || task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return fmt.Errorf("task %s is already %s", taskID, task.State)
+	}
+
+	task.State = TaskCancelled
+	task.CompletedAt = time.Now()
+	cancel := dm.cancels[taskID]
+
+	// 取消所有未完成的子任务
+	for _, sub := range task.SubTasks {
+		if sub.State == TaskPending || sub.State == TaskRunning {
+			sub.State = TaskCancelled
+			sub.CompletedAt = time.Now()
+		}
+	}
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+
+	if cancel != nil {
+		cancel()
+	}
+	dm.recordCollabTaskFinished(store, events, task)
+	return nil
+}
+
+// clearTaskCancel removes and releases the cancellation function once an
+// asynchronous collaboration execution has reached a terminal state.
+func (dm *DelegateManager) clearTaskCancel(taskID string) {
+	if dm == nil {
+		return
+	}
+	dm.mu.Lock()
+	cancel := dm.cancels[taskID]
+	delete(dm.cancels, taskID)
+	dm.mu.Unlock()
+	if cancel != nil {
+		cancel()
+	}
+}
+
+func (dm *DelegateManager) recordCollabTaskCreated(store taskstore.Store, events *taskstore.EventBus, task *CollabTask, plan *PlanResult) {
+	if store == nil || events == nil || task == nil {
+		return
+	}
+	record := taskstore.Record{
+		ID:                 task.ID,
+		ExecutionSessionID: task.ExecutionSessionID,
+		ParentSessionID:    task.ParentSessionID,
+		Role:               task.Role,
+		Source:             taskstore.SourceHTTP,
+		Mode:               collabModeToUnified(task.Mode),
+		Status:             collabStateToUnified(task.State),
+		Description:        task.Description,
+		Input:              task.Input,
+		CreatedAt:          task.CreatedAt,
+		Budget: taskstore.Budget{
+			Timeout:         task.Timeout,
+			MaxChildren:     len(task.SubTasks),
+			MaxConcurrent:   len(task.SubTasks),
+			RequireVerifier: planRequiresVerifier(plan),
+		},
+		Metadata: cloneStringMap(task.Metadata),
+	}
+	if _, err := store.Create(record); err != nil {
+		return
+	}
+	_ = events.Created(record)
+	for _, sub := range task.SubTasks {
+		// Persist every child as a first-class task record.  The parent event is
+		// still emitted below for compact progress consumers, but a child record
+		// gives the generic task API a durable task-to-session link and lets the
+		// task tree survive a process restart.
+		childRecord := taskstore.Record{
+			ID:                 sub.ID,
+			ParentID:           task.ID,
+			ExecutionSessionID: sub.ExecutionSessionID,
+			ParentSessionID:    sub.ParentSessionID,
+			Role:               sub.Role,
+			Source:             taskstore.SourceHTTP,
+			Mode:               collabModeToUnified(task.Mode),
+			Status:             taskstore.StatusPending,
+			Description:        sub.Description,
+			Input:              sub.Input,
+			CreatedAt:          task.CreatedAt,
+			Runtime: taskstore.RuntimeRef{
+				Type:      "collab-subtask",
+				AgentID:   sub.AgentID,
+				Workspace: sub.Runtime.CWD,
+				Metadata: map[string]string{
+					"provider":         sub.Runtime.Provider,
+					"model":            sub.Runtime.Model,
+					"memory_namespace": sub.Runtime.MemoryNamespace,
+					"approval_policy":  sub.Runtime.ApprovalPolicy,
+					"allow_delegate":   fmt.Sprintf("%t", sub.Runtime.AllowDelegate),
+				},
+			},
+			Budget: taskstore.Budget{Timeout: sub.Timeout},
+			Metadata: map[string]string{
+				"agent_id":             sub.AgentID,
+				"execution_session_id": sub.ExecutionSessionID,
+				"parent_session_id":    sub.ParentSessionID,
+				"role":                 sub.Role,
+			},
+		}
+		if _, err := store.Create(childRecord); err == nil {
+			_ = events.Created(childRecord)
+		}
+		_ = events.Emit(taskstore.Event{
+			Type:               taskstore.EventChildCreated,
+			TaskID:             task.ID,
+			ChildID:            sub.ID,
+			ExecutionSessionID: sub.ExecutionSessionID,
+			ParentSessionID:    sub.ParentSessionID,
+			Role:               sub.Role,
+			Message:            sub.Description,
+			Metadata: map[string]string{
+				"agent_id":         sub.AgentID,
+				"provider":         sub.Runtime.Provider,
+				"model":            sub.Runtime.Model,
+				"cwd":              sub.Runtime.CWD,
+				"memory_namespace": sub.Runtime.MemoryNamespace,
+				"approval_policy":  sub.Runtime.ApprovalPolicy,
+				"allow_delegate":   fmt.Sprintf("%t", sub.Runtime.AllowDelegate),
+			},
+		})
+	}
+	if plan != nil {
+		_ = store.SavePlannerTrace(task.ID, plan)
+		_ = events.Emit(taskstore.Event{
+			Type:               taskstore.EventPlanned,
+			TaskID:             task.ID,
+			ExecutionSessionID: task.ExecutionSessionID,
+			ParentSessionID:    task.ParentSessionID,
+			Role:               task.Role,
+			Mode:               collabModeToUnified(plan.Mode),
+			Message:            fmt.Sprintf("planner=%s mode=%s weight=%.6f", plan.Version, plan.Mode, plan.TotalWeight),
+			Metadata: map[string]string{
+				"planner":      plan.Version,
+				"planned_mode": string(plan.Mode),
+				"mdp_version":  plan.MDP.Version,
+				"mdp_state":    plan.MDP.StateKey,
+			},
+		})
+	}
+}
+
+func (dm *DelegateManager) recordCollabTaskStarted(store taskstore.Store, events *taskstore.EventBus, task *CollabTask) {
+	if store == nil || events == nil || task == nil {
+		return
+	}
+	record, ok, err := store.Get(task.ID)
+	if err != nil || !ok {
+		return
+	}
+	record.Status = taskstore.StatusRunning
+	record.StartedAt = time.Now()
+	if err := store.Update(record); err != nil {
+		return
+	}
+	_ = events.Started(record)
+}
+
+func (dm *DelegateManager) recordCollabTaskFinishedForCurrentStore(task *CollabTask) {
+	dm.mu.RLock()
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.RUnlock()
+	dm.recordCollabTaskFinished(store, events, task)
+}
+
+func (dm *DelegateManager) recordCollabTaskFinished(store taskstore.Store, events *taskstore.EventBus, task *CollabTask) {
+	if store == nil || events == nil || task == nil {
+		return
+	}
+	dm.mu.RLock()
+	snapshot := cloneCollabTask(task)
+	dm.mu.RUnlock()
+	record, ok, err := store.Get(snapshot.ID)
+	if err != nil || !ok {
+		return
+	}
+	record.Status = collabStateToUnified(snapshot.State)
+	record.CompletedAt = snapshot.CompletedAt
+	record.Outcome.Status = record.Status
+	record.Outcome.Verified = snapshot.Metadata["verifier_failed"] != "true" && snapshot.State == TaskCompleted
+	record.Outcome.Cost.ChildCount = len(snapshot.SubTasks)
+	record.Metadata = cloneStringMap(snapshot.Metadata)
+	if err := store.Update(record); err != nil {
+		return
+	}
+	switch snapshot.State {
+	case TaskCompleted:
+		_ = store.SaveResult(snapshot.ID, snapshot.Result)
+		_ = events.Completed(record, "collab task completed")
+	case TaskFailed, TaskTimeout:
+		_ = events.Failed(record, snapshot.Result)
+	case TaskCancelled:
+		_ = events.Emit(taskstore.Event{
+			Type:               taskstore.EventCancelled,
+			TaskID:             snapshot.ID,
+			ExecutionSessionID: snapshot.ExecutionSessionID,
+			ParentSessionID:    snapshot.ParentSessionID,
+			Role:               snapshot.Role,
+			Mode:               collabModeToUnified(snapshot.Mode),
+			Status:             taskstore.StatusCancelled,
+			Message:            "collab task cancelled",
+		})
+	}
+}
+
+func collabStateToUnified(state TaskState) taskstore.Status {
+	switch state {
+	case TaskPending:
+		return taskstore.StatusPending
+	case TaskRunning:
+		return taskstore.StatusRunning
+	case TaskCompleted:
+		return taskstore.StatusCompleted
+	case TaskFailed, TaskTimeout:
+		return taskstore.StatusFailed
+	case TaskCancelled:
+		return taskstore.StatusCancelled
+	default:
+		return ""
+	}
+}
+
+func collabModeToUnified(mode CollabMode) taskstore.Mode {
+	switch mode {
+	case ModeAuto:
+		return taskstore.ModeAuto
+	case ModeParallel:
+		return taskstore.ModeParallel
+	case ModePipeline:
+		return taskstore.ModePipeline
+	case ModeDebate:
+		return taskstore.ModeDebate
+	default:
+		return taskstore.ModeSingle
+	}
+}
+
+func planRequiresVerifier(plan *PlanResult) bool {
+	if plan == nil {
+		return false
+	}
+	if action, ok := plan.MDP.Actions[plan.Mode]; ok {
+		return action.RequireVerifier
+	}
+	return false
+}
+
+func cloneCollabTask(task *CollabTask) CollabTask {
+	if task == nil {
+		return CollabTask{}
+	}
+	cp := *task
+	cp.Metadata = cloneStringMap(task.Metadata)
+	if task.SubTasks != nil {
+		cp.SubTasks = make([]*SubTask, len(task.SubTasks))
+		for i, sub := range task.SubTasks {
+			subCopy := *sub
+			cp.SubTasks[i] = &subCopy
+		}
+	}
+	return cp
+}
+
+func cloneStringMap(in map[string]string) map[string]string {
+	if len(in) == 0 {
+		return nil
+	}
+	out := make(map[string]string, len(in))
+	for k, v := range in {
+		out[k] = v
+	}
+	return out
+}
+
+// executePipeline 串行执行
+func (dm *DelegateManager) executePipeline(ctx context.Context, task *CollabTask) {
+	defer dm.observePlannedOutcome(task)
+	defer dm.recordCollabTaskFinishedForCurrentStore(task)
+	defer dm.clearTaskCancel(task.ID)
+
+	dm.mu.Lock()
+	if task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	task.State = TaskRunning
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+	dm.recordCollabTaskStarted(store, events, task)
+
+	action := dm.actionForTask(task)
+	var pipelineResult string
+	input := task.Input
+	limit := len(task.SubTasks)
+	if action.MaxSteps > 0 && action.MaxSteps < limit {
+		limit = action.MaxSteps
+	}
+
+	for _, sub := range task.SubTasks[:limit] {
+		// 检查取消
+		dm.mu.RLock()
+		if task.State == TaskCancelled {
+			dm.mu.RUnlock()
+			return
+		}
+		dm.mu.RUnlock()
+
+		// 更新子任务输入（前一步的输出作为下一步的输入）
+		dm.mu.Lock()
+		sub.Input = input
+		dm.mu.Unlock()
+		dm.publishCollabMessage(MsgTaskAssign, "orchestrator", sub.AgentID, task.ID, sub.ID, map[string]any{
+			"state": "assigned",
+			"input": input,
+		})
+
+		result, err := dm.executeSubTaskWithAction(ctx, sub, action)
+		if err != nil {
+			dm.mu.Lock()
+			if task.State == TaskCancelled {
+				dm.mu.Unlock()
+				return
+			}
+			sub.State = TaskFailed
+			sub.Error = err.Error()
+			sub.CompletedAt = time.Now()
+			task.State = TaskFailed
+			task.Result = fmt.Sprintf("Pipeline failed at sub-task %s: %s", sub.ID, err)
+			task.CompletedAt = time.Now()
+			dm.mu.Unlock()
+			return
+		}
+
+		pipelineResult = result
+		input = result // 传递给下一步
+	}
+
+	dm.mu.Lock()
+	if task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	task.State = TaskCompleted
+	task.Result = pipelineResult
+	if limit < len(task.SubTasks) {
+		task.Metadata["step_limit_reached"] = "true"
+		task.Metadata["partial_failure"] = "true"
+	}
+	task.CompletedAt = time.Now()
+	dm.mu.Unlock()
+}
+
+// executeParallel 并行执行
+func (dm *DelegateManager) executeParallel(ctx context.Context, task *CollabTask) {
+	defer dm.observePlannedOutcome(task)
+	defer dm.recordCollabTaskFinishedForCurrentStore(task)
+	defer dm.clearTaskCancel(task.ID)
+
+	dm.mu.Lock()
+	if task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	task.State = TaskRunning
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+	dm.recordCollabTaskStarted(store, events, task)
+
+	action := dm.actionForTask(task)
+	var wg sync.WaitGroup
+	results := make([]string, len(task.SubTasks))
+	errors := make([]error, len(task.SubTasks))
+	maxConcurrent := action.MaxConcurrent
+	if maxConcurrent <= 0 || maxConcurrent > len(task.SubTasks) {
+		maxConcurrent = len(task.SubTasks)
+	}
+	if maxConcurrent <= 0 {
+		maxConcurrent = 1
+	}
+	sem := make(chan struct{}, maxConcurrent)
+
+	for i, sub := range task.SubTasks {
+		wg.Add(1)
+		go func(idx int, s *SubTask) {
+			defer wg.Done()
+			sem <- struct{}{}
+			defer func() { <-sem }()
+
+			result, err := dm.executeSubTaskWithAction(ctx, s, action)
+			dm.mu.Lock()
+			if s.State == TaskCancelled || task.State == TaskCancelled {
+				// Preserve cancellation recorded by CancelTask while the handler
+				// was unwinding. A late child completion must not resurrect it.
+			} else if err != nil {
+				s.State = TaskFailed
+				s.Error = err.Error()
+				errors[idx] = err
+			} else {
+				s.State = TaskCompleted
+				results[idx] = result
+			}
+			s.CompletedAt = time.Now()
+			dm.mu.Unlock()
+		}(i, sub)
+	}
+
+	wg.Wait()
+
+	// 检查结果
+	dm.mu.Lock()
+	if task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	failed := 0
+	for _, err := range errors {
+		if err != nil {
+			failed++
+		}
+	}
+
+	if failed == len(task.SubTasks) {
+		task.State = TaskFailed
+		task.Result = "All sub-tasks failed"
+	} else if failed > 0 {
+		task.State = TaskCompleted
+		task.Result = fmt.Sprintf("Completed with %d/%d sub-task failures", failed, len(task.SubTasks))
+		task.Metadata["partial_failure"] = "true"
+	} else {
+		task.State = TaskCompleted
+		task.Result = "All sub-tasks completed successfully"
+	}
+	task.Metadata["results_count"] = fmt.Sprintf("%d", len(results)-failed)
+	task.Metadata["max_concurrent"] = fmt.Sprintf("%d", maxConcurrent)
+	task.CompletedAt = time.Now()
+	dm.mu.Unlock()
+}
+
+// executeDebate 辩论模式 — Agent 轮流发言，最后投票
+func (dm *DelegateManager) executeDebate(ctx context.Context, task *CollabTask) {
+	defer dm.observePlannedOutcome(task)
+	defer dm.recordCollabTaskFinishedForCurrentStore(task)
+	defer dm.clearTaskCancel(task.ID)
+
+	dm.mu.Lock()
+	if task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	task.State = TaskRunning
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+	dm.recordCollabTaskStarted(store, events, task)
+
+	action := dm.actionForTask(task)
+	rounds := 2
+	if len(task.SubTasks) > 0 && action.MaxSteps > 0 {
+		rounds = maxInt(1, action.MaxSteps/len(task.SubTasks))
+	}
+	positions := make(map[string][]string) // agentID -> positions per round
+	votes := make(map[string]string)       // agentID -> voted position
+
+	for round := 0; round < rounds; round++ {
+		for _, sub := range task.SubTasks {
+			// 检查取消
+			dm.mu.RLock()
+			if task.State == TaskCancelled {
+				dm.mu.RUnlock()
+				return
+			}
+			dm.mu.RUnlock()
+
+			// 构建辩论上下文
+			debateCtx := fmt.Sprintf("Round %d/%d. Topic: %s\nInput: %s", round+1, rounds, task.Description, task.Input)
+			if round > 0 {
+				debateCtx += "\n\nPrevious positions:"
+				for aid, pos := range positions {
+					if len(pos) > 0 {
+						debateCtx += fmt.Sprintf("\n- Agent %s: %s", aid, pos[len(pos)-1])
+					}
+				}
+			}
+
+			dm.mu.Lock()
+			sub.Input = debateCtx
+			dm.mu.Unlock()
+			result, err := dm.executeSubTaskWithAction(ctx, sub, action)
+			if err != nil {
+				positions[sub.AgentID] = append(positions[sub.AgentID], fmt.Sprintf("[Error: %s]", err))
+			} else {
+				positions[sub.AgentID] = append(positions[sub.AgentID], result)
+			}
+			turn := map[string]any{
+				"round":        round + 1,
+				"total_rounds": rounds,
+				"state":        "position",
+				"position":     positions[sub.AgentID][len(positions[sub.AgentID])-1],
+			}
+			dm.publishCollabMessage(MsgDebateTurn, sub.AgentID, "", task.ID, sub.ID, turn)
+		}
+	}
+
+	// 投票阶段 — 每个 Agent 对最终立场投票
+	for _, sub := range task.SubTasks {
+		voteCtx := fmt.Sprintf("Debate topic: %s\n\nFinal positions:", task.Description)
+		for aid, pos := range positions {
+			if len(pos) > 0 {
+				voteCtx += fmt.Sprintf("\n- Agent %s: %s", aid, pos[len(pos)-1])
+			}
+		}
+		voteCtx += "\n\nCast your vote for the best position (reply with the agent ID you support)."
+
+		dm.mu.Lock()
+		sub.Input = voteCtx
+		dm.mu.Unlock()
+		result, err := dm.executeSubTaskWithAction(ctx, sub, action)
+		if err == nil {
+			votes[sub.AgentID] = result
+		}
+		dm.publishCollabMessage(MsgDebateVote, sub.AgentID, "", task.ID, sub.ID, map[string]any{
+			"round":        rounds,
+			"total_rounds": rounds,
+			"state":        "vote",
+			"vote":         result,
+			"error":        errorText(err),
+		})
+	}
+
+	// 统计投票
+	voteCount := make(map[string]int)
+	for _, v := range votes {
+		voteCount[v]++
+	}
+
+	winner := ""
+	maxVotes := 0
+	for aid, count := range voteCount {
+		if count > maxVotes {
+			maxVotes = count
+			winner = aid
+		}
+	}
+
+	dm.mu.Lock()
+	if task.State == TaskCancelled {
+		dm.mu.Unlock()
+		return
+	}
+	task.State = TaskCompleted
+	if winner != "" && len(positions[winner]) > 0 {
+		task.Result = positions[winner][len(positions[winner])-1]
+		if action.RequireVerifier {
+			if err := verifyFinalResult(task.Result); err != nil {
+				task.State = TaskFailed
+				task.Result = fmt.Sprintf("Debate verifier failed: %s", err)
+				task.Metadata["verifier_failed"] = "true"
+			}
+		}
+	} else {
+		task.Result = "Debate completed with no clear winner"
+		if action.RetryPolicy == "critic_tiebreak" {
+			for aid, pos := range positions {
+				if len(pos) > 0 {
+					winner = aid
+					task.Result = pos[len(pos)-1]
+					task.Metadata["critic_tiebreak"] = "true"
+					break
+				}
+			}
+		}
+	}
+	task.Metadata["debate_rounds"] = fmt.Sprintf("%d", rounds)
+	task.Metadata["debate_winner"] = winner
+	task.Metadata["debate_votes"] = fmt.Sprintf("%d", len(votes))
+	task.CompletedAt = time.Now()
+	dm.mu.Unlock()
+}
+
+func (dm *DelegateManager) observePlannedOutcome(task *CollabTask) {
+	if task == nil {
+		return
+	}
+	dm.mu.RLock()
+	mode := task.Mode
+	state := task.State
+	outcome := stateToOutcome(state)
+	if task.Metadata["partial_failure"] == "true" {
+		outcome = "partial"
+	}
+	planner := dm.planner
+	mdpPath := dm.mdpPath
+	costBudget, _ := strconv.ParseFloat(task.Metadata["cost_budget"], 64)
+	agentIDs := agentIDsFromSubTasks(task.SubTasks)
+	agents := make([]*AgentProfile, 0, len(agentIDs))
+	for _, agentID := range agentIDs {
+		if dm.registry == nil {
+			break
+		}
+		if profile, ok := dm.registry.Get(agentID); ok {
+			agents = append(agents, profile)
+		}
+	}
+	req := PlanRequest{
+		Description: task.Description,
+		Input:       task.Input,
+		AgentIDs:    agentIDs,
+		Agents:      agents,
+		Timeout:     task.Timeout,
+		CostBudget:  costBudget,
+	}
+	duration := time.Duration(0)
+	if !task.CreatedAt.IsZero() && !task.CompletedAt.IsZero() {
+		duration = task.CompletedAt.Sub(task.CreatedAt)
+	}
+	dm.mu.RUnlock()
+	if planner != nil {
+		planner.ObserveExecution(req, mode, outcome, duration)
+		if mdpPath != "" {
+			_ = planner.SaveMDP(mdpPath)
+		}
+	}
+}
+
+func agentIDsFromSubTasks(subTasks []*SubTask) []string {
+	agentIDs := make([]string, 0, len(subTasks))
+	for _, sub := range subTasks {
+		if sub != nil && sub.AgentID != "" {
+			agentIDs = append(agentIDs, sub.AgentID)
+		}
+	}
+	return agentIDs
+}
+
+func (dm *DelegateManager) actionForTask(task *CollabTask) MDPAction {
+	if task == nil {
+		return MDPAction{}
+	}
+	if task.Metadata != nil {
+		if raw := task.Metadata["planner_trace"]; raw != "" {
+			var plan PlanResult
+			if err := json.Unmarshal([]byte(raw), &plan); err == nil {
+				if action, ok := plan.MDP.Actions[task.Mode]; ok {
+					return action
+				}
+			}
+		}
+	}
+	return MDPActionForMode(PlanRequest{
+		Description: task.Description,
+		Input:       task.Input,
+		AgentIDs:    agentIDsFromSubTasks(task.SubTasks),
+		Timeout:     task.Timeout,
+	}, task.Mode)
+}
+
+func (dm *DelegateManager) executeSubTaskWithAction(ctx context.Context, sub *SubTask, action MDPAction) (string, error) {
+	attempts := 1
+	if action.RetryPolicy == "retry_failed_once" || action.RetryPolicy == "verify_each_step" {
+		attempts = 2
+	}
+	var lastErr error
+	for attempt := 1; attempt <= attempts; attempt++ {
+		result, err := dm.executeSubTask(ctx, sub)
+		if err == nil && action.RequireVerifier {
+			err = dm.verifySubTaskOutput(ctx, sub, result)
+			if err != nil {
+				dm.markSubTaskVerificationFailed(sub, err)
+			}
+		}
+		if err == nil {
+			if attempt > 1 {
+				dm.mu.Lock()
+				sub.Error = ""
+				dm.mu.Unlock()
+			}
+			return result, nil
+		}
+		lastErr = err
+		if !shouldRetryAction(action, attempt, attempts) {
+			break
+		}
+	}
+	if lastErr == nil {
+		lastErr = fmt.Errorf("sub-task %s failed", sub.ID)
+	}
+	return "", lastErr
+}
+
+func shouldRetryAction(action MDPAction, attempt, attempts int) bool {
+	if attempt >= attempts {
+		return false
+	}
+	return action.RetryPolicy == "retry_failed_once" || action.RetryPolicy == "verify_each_step"
+}
+
+func (dm *DelegateManager) verifySubTaskOutput(ctx context.Context, sub *SubTask, output string) error {
+	if dm.handler != nil {
+		if verifier, ok := dm.handler.(SubTaskVerifier); ok {
+			return verifier.VerifySubTask(ctx, sub, output)
+		}
+	}
+	if strings.TrimSpace(output) == "" {
+		return fmt.Errorf("verifier rejected empty output")
+	}
+	return nil
+}
+
+func (dm *DelegateManager) markSubTaskVerificationFailed(sub *SubTask, err error) {
+	dm.mu.Lock()
+	defer dm.mu.Unlock()
+	sub.State = TaskFailed
+	sub.Error = fmt.Sprintf("verification failed: %s", err)
+	sub.CompletedAt = time.Now()
+}
+
+func verifyFinalResult(output string) error {
+	if strings.TrimSpace(output) == "" {
+		return fmt.Errorf("verifier rejected empty final result")
+	}
+	return nil
+}
+
+// executeSubTask 执行单个子任务
+func (dm *DelegateManager) executeSubTask(ctx context.Context, sub *SubTask) (string, error) {
+	dm.mu.Lock()
+	if sub.State == TaskCancelled {
+		dm.mu.Unlock()
+		return "", context.Canceled
+	}
+	sub.State = TaskRunning
+	sub.StartedAt = time.Now()
+	applyRuntimeProfile(sub)
+	store := dm.taskStore
+	events := dm.taskEvents
+	dm.mu.Unlock()
+	dm.mu.RLock()
+	startedSnapshot := *sub
+	dm.mu.RUnlock()
+	dm.recordSubTaskStarted(store, events, &startedSnapshot)
+	if board := dm.Blackboard(); board != nil {
+		_, _ = board.Set(sub.ParentID, "subtask/"+sub.ID+"/state", string(TaskRunning), sub.AgentID)
+	}
+	dm.publishSubTaskMessage(sub, MsgTaskProgress, map[string]any{"state": string(TaskRunning)})
+
+	// 设置超时
+	var cancel context.CancelFunc
+	if sub.Timeout > 0 {
+		ctx, cancel = context.WithTimeout(ctx, sub.Timeout)
+		defer cancel()
+	}
+
+	if dm.handler == nil {
+		return "", fmt.Errorf("no task handler configured")
+	}
+
+	result, err := dm.handler.HandleSubTask(ctx, sub)
+
+	dm.mu.Lock()
+	var state TaskState
+	if sub.State == TaskCancelled {
+		// CancelTask may have marked the sub-task while the handler was still
+		// unwinding. Preserve the cancellation instead of publishing a late
+		// completed/failed state that would resurrect the parent task.
+		state = sub.State
+	} else if err != nil {
+		sub.State = TaskFailed
+		sub.Error = err.Error()
+		if ctx.Err() == context.DeadlineExceeded {
+			sub.State = TaskTimeout
+		}
+	} else {
+		sub.State = TaskCompleted
+		sub.Output = result
+		sub.Error = ""
+	}
+	sub.CompletedAt = time.Now()
+	state = sub.State
+	dm.mu.Unlock()
+	dm.mu.RLock()
+	finishedSnapshot := *sub
+	dm.mu.RUnlock()
+	dm.recordSubTaskFinished(store, events, &finishedSnapshot, state, result, err)
+	if board := dm.Blackboard(); board != nil {
+		_, _ = board.Set(sub.ParentID, "subtask/"+sub.ID+"/state", string(state), sub.AgentID)
+		if err == nil && strings.TrimSpace(result) != "" {
+			_, _ = board.Set(sub.ParentID, "subtask/"+sub.ID+"/output", result, sub.AgentID)
+		}
+		if err != nil {
+			_, _ = board.Set(sub.ParentID, "subtask/"+sub.ID+"/error", err.Error(), sub.AgentID)
+		}
+	}
+	progress := map[string]any{"state": string(state)}
+	if err == nil && strings.TrimSpace(result) != "" {
+		progress["output"] = result
+	} else if err != nil {
+		progress["error"] = err.Error()
+	}
+	dm.publishSubTaskMessage(sub, MsgTaskResult, progress)
+
+	return result, err
+}
+
+// recordSubTaskStarted updates the durable child record and emits a parent
+// progress event.  Child records are created when the parent is created; this
+// transition makes task details and WebSocket consumers observe real work,
+// rather than only the initial child-created event.
+func (dm *DelegateManager) recordSubTaskStarted(store taskstore.Store, events *taskstore.EventBus, sub *SubTask) {
+	if store == nil || events == nil || sub == nil {
+		return
+	}
+	record, ok, err := store.Get(sub.ID)
+	if err == nil && ok {
+		record.Status = taskstore.StatusRunning
+		record.StartedAt = sub.StartedAt
+		if err := store.Update(record); err == nil {
+			_ = events.Started(record)
+		}
+	}
+	_ = events.Emit(taskstore.Event{
+		Type:               taskstore.EventProgress,
+		TaskID:             sub.ParentID,
+		ChildID:            sub.ID,
+		ExecutionSessionID: sub.ExecutionSessionID,
+		ParentSessionID:    sub.ParentSessionID,
+		Role:               sub.Role,
+		Status:             taskstore.StatusRunning,
+		Message:            "sub-task started",
+		Metadata:           map[string]string{"agent_id": sub.AgentID},
+	})
+}
+
+func (dm *DelegateManager) recordSubTaskFinished(store taskstore.Store, events *taskstore.EventBus, sub *SubTask, state TaskState, result string, runErr error) {
+	if store == nil || events == nil || sub == nil {
+		return
+	}
+	record, ok, err := store.Get(sub.ID)
+	if err == nil && ok {
+		record.Status = subTaskStateToUnified(state)
+		record.CompletedAt = sub.CompletedAt
+		record.Outcome.Status = record.Status
+		record.Outcome.Verified = state == TaskCompleted && runErr == nil
+		if runErr != nil {
+			record.Outcome.UserFeedback = runErr.Error()
+		}
+		if updateErr := store.Update(record); updateErr == nil {
+			if result != "" {
+				_ = store.SaveResult(sub.ID, result)
+			}
+			switch record.Status {
+			case taskstore.StatusCompleted:
+				_ = events.Completed(record, "sub-task completed")
+			case taskstore.StatusCancelled:
+				_ = events.Emit(taskstore.Event{Type: taskstore.EventCancelled, TaskID: sub.ID, ExecutionSessionID: sub.ExecutionSessionID, ParentSessionID: sub.ParentSessionID, Role: sub.Role, Status: taskstore.StatusCancelled, Message: "sub-task cancelled"})
+			case taskstore.StatusFailed:
+				_ = events.Failed(record, sub.Error)
+			}
+		}
+	}
+	message := "sub-task completed"
+	if state == TaskCancelled {
+		message = "sub-task cancelled"
+	} else if runErr != nil {
+		message = "sub-task failed"
+	}
+	metadata := map[string]string{"agent_id": sub.AgentID}
+	if runErr != nil {
+		metadata["error"] = runErr.Error()
+	}
+	_ = events.Emit(taskstore.Event{
+		Type:               taskstore.EventProgress,
+		TaskID:             sub.ParentID,
+		ChildID:            sub.ID,
+		ExecutionSessionID: sub.ExecutionSessionID,
+		ParentSessionID:    sub.ParentSessionID,
+		Role:               sub.Role,
+		Status:             subTaskStateToUnified(state),
+		Message:            message,
+		Metadata:           metadata,
+	})
+}
+
+func subTaskStateToUnified(state TaskState) taskstore.Status {
+	switch state {
+	case TaskPending:
+		return taskstore.StatusPending
+	case TaskRunning:
+		return taskstore.StatusRunning
+	case TaskCompleted:
+		return taskstore.StatusCompleted
+	case TaskCancelled:
+		return taskstore.StatusCancelled
+	case TaskFailed, TaskTimeout:
+		return taskstore.StatusFailed
+	default:
+		return taskstore.StatusFailed
+	}
+}
+
+func (dm *DelegateManager) publishSubTaskMessage(sub *SubTask, messageType MessageType, payload map[string]any) {
+	if sub == nil {
+		return
+	}
+	dm.publishCollabMessage(messageType, sub.AgentID, "", sub.ParentID, sub.ID, payload)
+}
+
+func (dm *DelegateManager) publishCollabMessage(messageType MessageType, from, to, taskID, subtaskID string, payload map[string]any) {
+	bus := dm.MessageBus()
+	if bus == nil || strings.TrimSpace(from) == "" {
+		return
+	}
+	if payload == nil {
+		payload = map[string]any{}
+	}
+	payload["task_id"] = taskID
+	payload["subtask_id"] = subtaskID
+	message := NewMessage(messageType, from, to, payload).
+		WithCorrelation(strings.TrimSpace(subtaskID)).
+		WithMetadata("task_id", taskID)
+	if dm != nil {
+		dm.mu.RLock()
+		if task := dm.tasks[taskID]; task != nil {
+			if task.ExecutionSessionID != "" {
+				message.WithMetadata("execution_session_id", task.ExecutionSessionID)
+			}
+			if task.ParentSessionID != "" {
+				message.WithMetadata("parent_session_id", task.ParentSessionID)
+			}
+		}
+		dm.mu.RUnlock()
+	}
+	_ = bus.Publish(message)
+}
+
+func errorText(err error) string {
+	if err == nil {
+		return ""
+	}
+	return err.Error()
+}
+
+func applyRuntimeProfile(sub *SubTask) {
+	if sub == nil {
+		return
+	}
+	runtime := sub.Runtime
+	if runtime.Timeout > 0 && (sub.Timeout <= 0 || runtime.Timeout < sub.Timeout) {
+		sub.Timeout = runtime.Timeout
+	}
+	constraints := runtimeConstraintText(runtime)
+	if constraints == "" || strings.Contains(sub.Input, runtimeConstraintMarker) {
+		return
+	}
+	sub.Input = strings.TrimSpace(sub.Input)
+	if sub.Input == "" {
+		sub.Input = constraints
+		return
+	}
+	sub.Input += "\n\n" + constraints
+}
+
+func runtimeConstraintText(runtime AgentRuntimeProfile) string {
+	if !runtimeHasConstraints(runtime) {
+		return ""
+	}
+	var lines []string
+	if strings.TrimSpace(runtime.Provider) != "" || strings.TrimSpace(runtime.Model) != "" {
+		lines = append(lines, fmt.Sprintf("- Model: provider=%s model=%s", runtime.Provider, runtime.Model))
+	}
+	if len(runtime.ToolAllowlist) > 0 {
+		lines = append(lines, "- Tool allowlist: "+strings.Join(runtime.ToolAllowlist, ", "))
+	}
+	if strings.TrimSpace(runtime.CWD) != "" {
+		lines = append(lines, "- Working directory: "+strings.TrimSpace(runtime.CWD))
+	}
+	if strings.TrimSpace(runtime.MemoryNamespace) != "" {
+		lines = append(lines, "- Memory namespace: "+strings.TrimSpace(runtime.MemoryNamespace))
+	}
+	if strings.TrimSpace(runtime.ApprovalPolicy) != "" {
+		lines = append(lines, "- Approval policy: "+strings.TrimSpace(runtime.ApprovalPolicy))
+	}
+	if runtime.MaxIterations > 0 {
+		lines = append(lines, fmt.Sprintf("- Max iterations: %d", runtime.MaxIterations))
+	}
+	if runtime.Timeout > 0 {
+		lines = append(lines, fmt.Sprintf("- Timeout: %s", runtime.Timeout))
+	}
+	if !runtime.AllowDelegate {
+		lines = append(lines, "- Recursive delegation: disabled")
+	}
+	if len(lines) == 0 {
+		return ""
+	}
+	return runtimeConstraintMarker + "\n" + strings.Join(lines, "\n")
+}
+
+func runtimeHasConstraints(runtime AgentRuntimeProfile) bool {
+	return strings.TrimSpace(runtime.Provider) != "" ||
+		strings.TrimSpace(runtime.Model) != "" ||
+		len(runtime.ToolAllowlist) > 0 ||
+		strings.TrimSpace(runtime.CWD) != "" ||
+		strings.TrimSpace(runtime.MemoryNamespace) != "" ||
+		strings.TrimSpace(runtime.ApprovalPolicy) != "" ||
+		runtime.MaxIterations > 0 ||
+		runtime.Timeout > 0
+}
+
+// Stats 委派统计
+func (dm *DelegateManager) Stats() (total, running, completed, failed int) {
+	dm.mu.RLock()
+	defer dm.mu.RUnlock()
+
+	for _, t := range dm.tasks {
+		total++
+		switch t.State {
+		case TaskRunning, TaskPending:
+			running++
+		case TaskCompleted:
+			completed++
+		case TaskFailed, TaskTimeout:
+			failed++
+		}
+	}
+	return
+}
