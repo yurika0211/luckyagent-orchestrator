@@ -585,7 +585,9 @@ func (q *TaskQueue) persistLocked() error {
 		NextID:  q.nextID.Load(),
 		Tasks:   tasks,
 	}
-	data, err := json.MarshalIndent(state, "", "  ")
+	// Whitespace is not part of the version-1 snapshot contract. Compact JSON
+	// avoids repeatedly expanding embedded checkpoints while holding the lock.
+	data, err := json.Marshal(state)
 	if err != nil {
 		return fmt.Errorf("marshal autonomy queue store: %w", err)
 	}
