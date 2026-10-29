@@ -105,11 +105,32 @@ func (e *Execution) SaveCheckpoint(data json.RawMessage) error {
 	if !json.Valid(data) {
 		return fmt.Errorf("invalid checkpoint JSON")
 	}
-	return e.update(func(t *QueueTask) error {
+	if e == nil || e.queue == nil {
+		return ErrStaleExecution
+	}
+	e.queue.mu.Lock()
+	defer e.queue.mu.Unlock()
+	current, ok := e.queue.tasks[e.taskID]
+	if !ok || current.State != TaskInProgress || current.Attempts != e.attempt {
+		return ErrStaleExecution
+	}
+	previousLog := e.queue.checkpointLog[e.taskID]
+	previousSequence := e.queue.checkpointSeq[e.taskID]
+	previousSnapshot := e.queue.checkpointSnapshot[e.taskID]
+	if err := e.queue.appendCheckpointEventLocked(current, data); err != nil {
+		return err
+	}
+	err := e.queue.updateLocked(e.taskID, func(t *QueueTask) error {
 		t.Checkpoint = append(json.RawMessage(nil), data...)
 		t.CheckpointAt = time.Now()
 		return nil
 	})
+	if err != nil {
+		e.queue.checkpointLog[e.taskID] = previousLog
+		e.queue.checkpointSeq[e.taskID] = previousSequence
+		e.queue.checkpointSnapshot[e.taskID] = previousSnapshot
+	}
+	return err
 }
 
 func (e *Execution) BeginOperation(op Operation) (Operation, error) {

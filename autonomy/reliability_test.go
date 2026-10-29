@@ -1,12 +1,14 @@
 package autonomy
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -76,6 +78,55 @@ func TestRecoveryCheckpointAndOperationReconciliation(t *testing.T) {
 	}
 	if err := exec.SaveCheckpoint(json.RawMessage("{}")); !errors.Is(err, ErrStaleExecution) {
 		t.Fatalf("stale execution wrote checkpoint: %v", err)
+	}
+}
+
+func TestCheckpointEventLogRehydratesLatestAndBoundsWriteAmplification(t *testing.T) {
+	q, path := persistedQueue(t)
+	task := q.Add("long task", "", PriorityNormal, nil)
+	claimed, err := q.claim("worker", task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	exec := NewExecution(q, claimed)
+	var legacyBytes int64
+	latest := ""
+	for i := 0; i < 40; i++ {
+		latest = fmt.Sprintf(`{"version":1,"step":%d,"messages":%q}`, i, strings.Repeat("repeated tool evidence ", 800))
+		if err := exec.SaveCheckpoint(json.RawMessage(latest)); err != nil {
+			t.Fatal(err)
+		}
+		data, err := os.ReadFile(path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		legacyBytes += int64(len(data))
+	}
+	eventInfo, err := os.Stat(path + ".checkpoint-events.jsonl")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if eventInfo.Size() >= legacyBytes {
+		t.Fatalf("checkpoint event log did not reduce write amplification: log=%d legacy=%d", eventInfo.Size(), legacyBytes)
+	}
+	queueData, err := os.ReadFile(path)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if bytes.Contains(queueData, []byte(`"messages"`)) {
+		t.Fatal("latest non-snapshot checkpoint was copied into the queue metadata")
+	}
+
+	reloaded := NewTaskQueue(8)
+	if _, err := reloaded.EnablePersistence(path); err != nil {
+		t.Fatal(err)
+	}
+	resumed, err := reloaded.claim("worker-2", task.ID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if resumed == nil || string(resumed.Checkpoint) != latest {
+		t.Fatalf("latest checkpoint was not restored: %s", resumed.Checkpoint)
 	}
 }
 

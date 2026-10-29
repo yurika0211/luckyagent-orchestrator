@@ -7,9 +7,14 @@
 package autonomy
 
 import (
+	"bufio"
+	"bytes"
+	"compress/gzip"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
+	"io"
 	"os"
 	"path/filepath"
 	"sort"
@@ -116,6 +121,9 @@ type TaskQueue struct {
 	policy             RunPolicy
 	persistenceError   error
 	sessionInitializer func(*QueueTask) (string, error)
+	checkpointLog      map[string]bool
+	checkpointSeq      map[string]uint64
+	checkpointSnapshot map[string]uint64
 }
 
 type persistedTaskQueue struct {
@@ -130,8 +138,11 @@ func NewTaskQueue(bufferSize int) *TaskQueue {
 		bufferSize = 64
 	}
 	return &TaskQueue{
-		tasks:  make(map[string]*QueueTask, bufferSize),
-		policy: DefaultRunPolicy(),
+		tasks:              make(map[string]*QueueTask, bufferSize),
+		policy:             DefaultRunPolicy(),
+		checkpointLog:      make(map[string]bool),
+		checkpointSeq:      make(map[string]uint64),
+		checkpointSnapshot: make(map[string]uint64),
 	}
 }
 
@@ -487,6 +498,15 @@ func (q *TaskQueue) EnablePersistence(path string) (int, error) {
 	q.mu.Lock()
 	defer q.mu.Unlock()
 	q.persistPath = path
+	if q.checkpointLog == nil {
+		q.checkpointLog = make(map[string]bool)
+	}
+	if q.checkpointSeq == nil {
+		q.checkpointSeq = make(map[string]uint64)
+	}
+	if q.checkpointSnapshot == nil {
+		q.checkpointSnapshot = make(map[string]uint64)
+	}
 
 	if os.IsNotExist(err) {
 		q.persistenceError = nil
@@ -525,6 +545,10 @@ func (q *TaskQueue) EnablePersistence(path string) (int, error) {
 		if n := parseTaskNumericID(task.ID); n > maxID {
 			maxID = n
 		}
+	}
+	if err := q.replayCheckpointEventsLocked(); err != nil {
+		q.persistenceError = err
+		return 0, err
 	}
 	q.nextID.Store(maxID)
 
@@ -574,6 +598,9 @@ func (q *TaskQueue) persistLocked() error {
 			continue
 		}
 		cp := *t
+		if q.checkpointLog[t.ID] && q.checkpointSnapshot[t.ID] != q.checkpointSeq[t.ID] {
+			cp.Checkpoint = nil
+		}
 		tasks = append(tasks, cp)
 	}
 	sort.Slice(tasks, func(i, j int) bool {
@@ -595,6 +622,177 @@ func (q *TaskQueue) persistLocked() error {
 		return fmt.Errorf("create autonomy queue store dir: %w", err)
 	}
 	return utils.WriteFileAtomic(q.persistPath, data, 0o600)
+}
+
+const checkpointSnapshotInterval = 32
+
+type checkpointEvent struct {
+	TaskID   string
+	Attempt  int
+	Sequence uint64
+	Data     string
+}
+
+func (q *TaskQueue) checkpointEventsPath() string {
+	if q == nil || strings.TrimSpace(q.persistPath) == "" {
+		return ""
+	}
+	return q.persistPath + ".checkpoint-events.jsonl"
+}
+
+func encodeCheckpointEvent(data []byte) (string, error) {
+	var compressed bytes.Buffer
+	writer := gzip.NewWriter(&compressed)
+	if _, err := writer.Write(data); err != nil {
+		_ = writer.Close()
+		return "", err
+	}
+	if err := writer.Close(); err != nil {
+		return "", err
+	}
+	return base64.RawStdEncoding.EncodeToString(compressed.Bytes()), nil
+}
+
+func decodeCheckpointEvent(data string) ([]byte, error) {
+	compressed, err := base64.RawStdEncoding.DecodeString(data)
+	if err != nil {
+		return nil, err
+	}
+	reader, err := gzip.NewReader(bytes.NewReader(compressed))
+	if err != nil {
+		return nil, err
+	}
+	defer reader.Close()
+	return io.ReadAll(reader)
+}
+
+func (q *TaskQueue) appendCheckpointEventLocked(task *QueueTask, data []byte) error {
+	path := q.checkpointEventsPath()
+	if path == "" {
+		return nil
+	}
+	encoded, err := encodeCheckpointEvent(data)
+	if err != nil {
+		return fmt.Errorf("compress checkpoint event: %w", err)
+	}
+	event, err := json.Marshal(checkpointEvent{TaskID: task.ID, Attempt: task.Attempts, Sequence: q.checkpointSeq[task.ID] + 1, Data: encoded})
+	if err != nil {
+		return fmt.Errorf("marshal checkpoint event: %w", err)
+	}
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+		return fmt.Errorf("create checkpoint event dir: %w", err)
+	}
+	file, err := os.OpenFile(path, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0o600)
+	if err != nil {
+		return fmt.Errorf("open checkpoint event log: %w", err)
+	}
+	if _, err := file.Write(append(event, '\n')); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("append checkpoint event: %w", err)
+	}
+	if err := file.Sync(); err != nil {
+		_ = file.Close()
+		return fmt.Errorf("sync checkpoint event: %w", err)
+	}
+	if err := file.Close(); err != nil {
+		return fmt.Errorf("close checkpoint event log: %w", err)
+	}
+	sequence := q.checkpointSeq[task.ID] + 1
+	q.checkpointSeq[task.ID] = sequence
+	q.checkpointLog[task.ID] = true
+	if sequence%checkpointSnapshotInterval == 0 {
+		q.checkpointSnapshot[task.ID] = sequence
+	}
+	return nil
+}
+
+func (q *TaskQueue) replayCheckpointEventsLocked() error {
+	path := q.checkpointEventsPath()
+	if path == "" {
+		return nil
+	}
+	file, err := os.Open(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return fmt.Errorf("open checkpoint event log: %w", err)
+	}
+	defer file.Close()
+	scanner := bufio.NewScanner(file)
+	scanner.Buffer(make([]byte, 64*1024), 64*1024*1024)
+	for scanner.Scan() {
+		var event checkpointEvent
+		if err := json.Unmarshal(scanner.Bytes(), &event); err != nil {
+			return fmt.Errorf("parse checkpoint event: %w", err)
+		}
+		task, ok := q.tasks[event.TaskID]
+		if !ok || event.Sequence <= q.checkpointSeq[event.TaskID] || event.Attempt != task.Attempts {
+			continue
+		}
+		checkpoint, err := decodeCheckpointEvent(event.Data)
+		if err != nil {
+			return fmt.Errorf("decode checkpoint event %s/%d: %w", event.TaskID, event.Sequence, err)
+		}
+		if !json.Valid(checkpoint) {
+			return fmt.Errorf("checkpoint event %s/%d is invalid JSON", event.TaskID, event.Sequence)
+		}
+		task.Checkpoint = append(json.RawMessage(nil), checkpoint...)
+		q.checkpointSeq[event.TaskID] = event.Sequence
+		q.checkpointLog[event.TaskID] = true
+		if event.Sequence%checkpointSnapshotInterval == 0 {
+			q.checkpointSnapshot[event.TaskID] = event.Sequence
+		}
+	}
+	if err := scanner.Err(); err != nil {
+		return fmt.Errorf("read checkpoint event log: %w", err)
+	}
+	return nil
+}
+
+func (q *TaskQueue) rewriteCheckpointEventsLocked() error {
+	path := q.checkpointEventsPath()
+	if path == "" {
+		return nil
+	}
+	var encoded bytes.Buffer
+	nextLog := make(map[string]bool)
+	nextSeq := make(map[string]uint64)
+	nextSnapshot := make(map[string]uint64)
+	for _, task := range q.tasks {
+		if task == nil || !q.checkpointLog[task.ID] || len(task.Checkpoint) == 0 {
+			continue
+		}
+		data, err := encodeCheckpointEvent(task.Checkpoint)
+		if err != nil {
+			return fmt.Errorf("compress checkpoint snapshot: %w", err)
+		}
+		line, err := json.Marshal(checkpointEvent{TaskID: task.ID, Attempt: task.Attempts, Sequence: 1, Data: data})
+		if err != nil {
+			return fmt.Errorf("marshal checkpoint snapshot: %w", err)
+		}
+		encoded.Write(line)
+		encoded.WriteByte('\n')
+		nextLog[task.ID] = true
+		nextSeq[task.ID] = 1
+		nextSnapshot[task.ID] = 1
+	}
+	if encoded.Len() == 0 {
+		if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+			return fmt.Errorf("remove checkpoint event log: %w", err)
+		}
+	} else {
+		if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
+			return fmt.Errorf("create checkpoint event dir: %w", err)
+		}
+		if err := os.WriteFile(path, encoded.Bytes(), 0o600); err != nil {
+			return fmt.Errorf("rewrite checkpoint event log: %w", err)
+		}
+	}
+	q.checkpointLog = nextLog
+	q.checkpointSeq = nextSeq
+	q.checkpointSnapshot = nextSnapshot
+	return nil
 }
 
 func parseTaskNumericID(id string) int64 {
