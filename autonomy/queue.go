@@ -77,12 +77,18 @@ const (
 
 // QueueTask represents a task in the autonomy task queue.
 type QueueTask struct {
-	SessionID          string            `json:"session_id,omitempty"`
-	Attempts           int               `json:"attempts,omitempty"`
-	BudgetStartAttempt int               `json:"budget_start_attempt,omitempty"`
-	Retries            int               `json:"retries,omitempty"`
-	Continuations      int               `json:"continuations,omitempty"`
-	FirstStartedAt     time.Time         `json:"first_started_at,omitempty"`
+	SessionID          string    `json:"session_id,omitempty"`
+	Attempts           int       `json:"attempts,omitempty"`
+	BudgetStartAttempt int       `json:"budget_start_attempt,omitempty"`
+	Retries            int       `json:"retries,omitempty"`
+	Continuations      int       `json:"continuations,omitempty"`
+	FirstStartedAt     time.Time `json:"first_started_at,omitempty"`
+	// ExecutedNanos is active worker time; queue waits, backoff, and blocked
+	// periods are intentionally excluded from the total execution budget.
+	ExecutedNanos      int64             `json:"executed_nanos,omitempty"`
+	LeaseOwner         string            `json:"lease_owner,omitempty"`
+	LeaseExpiresAt     time.Time         `json:"lease_expires_at,omitempty"`
+	LastHeartbeatAt    time.Time         `json:"last_heartbeat_at,omitempty"`
 	NextRunAt          time.Time         `json:"next_run_at,omitempty"`
 	CheckpointAt       time.Time         `json:"checkpoint_at,omitempty"`
 	Checkpoint         json.RawMessage   `json:"checkpoint,omitempty"`
@@ -248,6 +254,25 @@ func (q *TaskQueue) claim(workerID, taskID string) (*QueueTask, error) {
 	defer q.mu.Unlock()
 
 	now := time.Now()
+	// Reclaim crashed workers after their lease expires while preserving the
+	// checkpoint and operation ledger for the next attempt.
+	for _, current := range q.tasks {
+		if current.State != TaskInProgress || current.LeaseExpiresAt.IsZero() || now.Before(current.LeaseExpiresAt) {
+			continue
+		}
+		if err := q.updateLocked(current.ID, func(next *QueueTask) error {
+			next.State = TaskReady
+			next.AssignedTo = ""
+			next.LeaseOwner = ""
+			next.LeaseExpiresAt = time.Time{}
+			next.LastHeartbeatAt = time.Time{}
+			next.StartedAt = time.Time{}
+			next.Error = strings.TrimSpace(joinNonEmpty(next.Error, "worker lease expired; task requeued"))
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+	}
 	var best *QueueTask
 	for _, t := range q.tasks {
 		if t.State != TaskReady || (taskID != "" && t.ID != taskID) || now.Before(t.NextRunAt) {
@@ -273,6 +298,9 @@ func (q *TaskQueue) claim(workerID, taskID string) (*QueueTask, error) {
 
 	if err := q.updateLocked(best.ID, func(t *QueueTask) error {
 		t.State, t.AssignedTo, t.StartedAt = TaskInProgress, workerID, now
+		t.LeaseOwner = workerID
+		t.LeaseExpiresAt = now.Add(q.policy.LeaseDuration)
+		t.LastHeartbeatAt = now
 		t.NextRunAt, t.CompletedAt = time.Time{}, time.Time{}
 		t.BlockReason = ""
 		t.Attempts++
@@ -344,6 +372,7 @@ func (q *TaskQueue) Fail(taskID, errMsg string, retry bool) error {
 
 	return q.updateLocked(taskID, func(t *QueueTask) error {
 		t.Error, t.AssignedTo = errMsg, ""
+		t.LeaseOwner, t.LeaseExpiresAt, t.LastHeartbeatAt = "", time.Time{}, time.Time{}
 		t.Retries++
 		if retry && t.Retries <= q.policy.MaxRetries {
 			t.State = TaskReady
@@ -362,6 +391,7 @@ func (q *TaskQueue) Block(taskID, reason string) error {
 
 	return q.updateLocked(taskID, func(t *QueueTask) error {
 		t.State, t.BlockReason, t.AssignedTo = TaskBlocked, reason, ""
+		t.LeaseOwner, t.LeaseExpiresAt, t.LastHeartbeatAt = "", time.Time{}, time.Time{}
 		return nil
 	})
 }
@@ -382,11 +412,14 @@ func (q *TaskQueue) Unblock(taskID string) error {
 		}
 		t.State, t.BlockReason, t.Error = TaskReady, "", ""
 		t.NextRunAt, t.CompletedAt = time.Time{}, time.Time{}
-		// Explicit intervention grants a new bounded run; checkpoints survive.
+		// Explicit intervention invalidates the old claim, but active-time and
+		// slice budgets remain consumed; checkpoints survive.
 		t.Attempts++
 		t.Retries = 0
-		t.BudgetStartAttempt = t.Attempts
-		t.FirstStartedAt = time.Time{}
+		t.AssignedTo = ""
+		t.LeaseOwner = ""
+		t.LeaseExpiresAt = time.Time{}
+		t.LastHeartbeatAt = time.Time{}
 		return nil
 	})
 }
@@ -518,6 +551,9 @@ func (q *TaskQueue) EnablePersistence(path string) (int, error) {
 		if task.State == TaskInProgress {
 			task.State = TaskReady
 			task.AssignedTo = ""
+			task.LeaseOwner = ""
+			task.LeaseExpiresAt = time.Time{}
+			task.LastHeartbeatAt = time.Time{}
 			task.StartedAt = time.Time{}
 			task.Error = strings.TrimSpace(joinNonEmpty(task.Error, "restored from interrupted autonomy run"))
 		}
@@ -532,6 +568,22 @@ func (q *TaskQueue) EnablePersistence(path string) (int, error) {
 		return len(q.tasks), err
 	}
 	return len(q.tasks), nil
+}
+
+// RenewLease extends the active worker lease without changing task state.
+// An expired or stale owner cannot revive a claim after it is reclaimed.
+func (q *TaskQueue) RenewLease(taskID, workerID string) error {
+	q.mu.Lock()
+	defer q.mu.Unlock()
+	now := time.Now()
+	return q.updateLocked(taskID, func(t *QueueTask) error {
+		if t.State != TaskInProgress || t.LeaseOwner != workerID || t.AssignedTo != workerID {
+			return ErrStaleExecution
+		}
+		t.LastHeartbeatAt = now
+		t.LeaseExpiresAt = now.Add(q.policy.LeaseDuration)
+		return nil
+	})
 }
 
 // PersistencePath returns the queue store path, if persistence is enabled.

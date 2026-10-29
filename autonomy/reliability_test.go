@@ -124,6 +124,92 @@ func TestRecoveryYieldDoesNotSpendRetryBudget(t *testing.T) {
 	}
 }
 
+func TestActiveBudgetIgnoresQueueWait(t *testing.T) {
+	q := NewTaskQueue(8)
+	q.policy = RunPolicy{MaxRetries: 1, RetryInitial: time.Millisecond, RetryMax: time.Second, MaxSlices: 10, MaxTotalTime: time.Hour, LeaseDuration: time.Minute}
+	task := q.Add("long task", "", PriorityNormal, nil)
+	claimed, err := q.claim("w1", task.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	q.mu.Lock()
+	q.tasks[task.ID].FirstStartedAt = time.Now().Add(-3 * time.Hour)
+	q.mu.Unlock()
+	if err := q.finishAttempt(claimed, &WorkerResult{Error: ErrYield, Duration: 10 * time.Minute}, false); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := q.Get(task.ID)
+	if current.State != TaskReady || current.ExecutedNanos != (10*time.Minute).Nanoseconds() {
+		t.Fatalf("active duration not recorded: %+v", current)
+	}
+	q.mu.Lock()
+	q.tasks[task.ID].NextRunAt = time.Time{}
+	q.mu.Unlock()
+	if next, err := q.claim("w2", task.ID); err != nil || next == nil || next.State != TaskInProgress {
+		t.Fatalf("wall-clock wait incorrectly exhausted budget: task=%+v err=%v", next, err)
+	}
+	q.mu.Lock()
+	q.tasks[task.ID].ExecutedNanos = time.Hour.Nanoseconds()
+	q.tasks[task.ID].State = TaskReady
+	q.tasks[task.ID].AssignedTo = ""
+	q.tasks[task.ID].LeaseOwner = ""
+	q.tasks[task.ID].LeaseExpiresAt = time.Time{}
+	q.tasks[task.ID].NextRunAt = time.Time{}
+	q.mu.Unlock()
+	if next, err := q.claim("w3", task.ID); err != nil || next != nil {
+		t.Fatalf("active budget overrun was not blocked: task=%+v err=%v", next, err)
+	}
+	blocked, _ := q.Get(task.ID)
+	if blocked.State != TaskBlocked || blocked.BlockReason == "" {
+		t.Fatalf("missing active-budget block: %+v", blocked)
+	}
+}
+
+func TestExpiredLeaseIsReclaimedAndHeartbeatExtendsIt(t *testing.T) {
+	q := NewTaskQueue(8)
+	q.policy = RunPolicy{MaxRetries: 1, RetryInitial: time.Second, RetryMax: time.Second, MaxSlices: 4, MaxTotalTime: time.Hour, LeaseDuration: 20 * time.Millisecond}
+	task := q.Add("leased", "", PriorityNormal, nil)
+	claimed, err := q.claim("w1", task.ID)
+	if err != nil || claimed == nil {
+		t.Fatalf("claim: %v %v", claimed, err)
+	}
+	if err := q.RenewLease(task.ID, "w1"); err != nil {
+		t.Fatal(err)
+	}
+	heartbeat, _ := q.Get(task.ID)
+	if heartbeat.LeaseOwner != "w1" || heartbeat.LeaseExpiresAt.Before(time.Now()) || heartbeat.LastHeartbeatAt.IsZero() {
+		t.Fatalf("heartbeat did not extend lease: %+v", heartbeat)
+	}
+	q.mu.Lock()
+	q.tasks[task.ID].LeaseExpiresAt = time.Now().Add(-time.Second)
+	q.mu.Unlock()
+	reclaimed, err := q.claim("w2", task.ID)
+	if err != nil || reclaimed == nil || reclaimed.LeaseOwner != "w2" {
+		t.Fatalf("expired lease was not reclaimed: task=%+v err=%v", reclaimed, err)
+	}
+	if err := q.RenewLease(task.ID, "w1"); !errors.Is(err, ErrStaleExecution) {
+		t.Fatalf("stale owner renewed lease: %v", err)
+	}
+}
+
+func TestUnblockPreservesActiveBudget(t *testing.T) {
+	q := NewTaskQueue(8)
+	q.policy = RunPolicy{MaxRetries: 1, RetryInitial: time.Second, RetryMax: time.Second, MaxSlices: 4, MaxTotalTime: time.Hour, LeaseDuration: time.Minute}
+	task := q.Add("blocked", "", PriorityNormal, nil)
+	claimed, _ := q.claim("w1", task.ID)
+	started := claimed.FirstStartedAt
+	if err := q.finishAttempt(claimed, &WorkerResult{Error: ErrBlocked, Duration: 5 * time.Minute}, false); err != nil {
+		t.Fatal(err)
+	}
+	if err := q.Unblock(task.ID); err != nil {
+		t.Fatal(err)
+	}
+	current, _ := q.Get(task.ID)
+	if current.ExecutedNanos != (5*time.Minute).Nanoseconds() || current.FirstStartedAt.IsZero() || !current.FirstStartedAt.Equal(started) {
+		t.Fatalf("unblock reset active budget: %+v", current)
+	}
+}
+
 func TestRecoveryPersistenceFailureDoesNotExposeWork(t *testing.T) {
 	q, _ := persistedQueue(t)
 	task := q.Add("safe", "", PriorityNormal, nil)

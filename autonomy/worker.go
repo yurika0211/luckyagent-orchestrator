@@ -250,6 +250,29 @@ func (w *Worker) Execute(ctx context.Context, task *QueueTask) *WorkerResult {
 	w.mu.Lock()
 	w.TaskSessionID = sessionID
 	w.mu.Unlock()
+	var heartbeatStop chan struct{}
+	if loopCfg.Execution != nil && w.queue != nil {
+		heartbeatStop = make(chan struct{})
+		interval := w.queue.policy.LeaseDuration / 3
+		if interval <= 0 {
+			interval = 30 * time.Second
+		}
+		go func(exec *Execution, stop <-chan struct{}) {
+			ticker := time.NewTicker(interval)
+			defer ticker.Stop()
+			for {
+				select {
+				case <-ticker.C:
+					if err := exec.RenewLease(w.ID); err != nil {
+						return
+					}
+				case <-stop:
+					return
+				}
+			}
+		}(loopCfg.Execution, heartbeatStop)
+		defer close(heartbeatStop)
+	}
 	result, err := executor.RunLoopWithSession(ctx, sessionID, prompt, loopCfg)
 
 	duration := time.Since(start)
@@ -588,9 +611,9 @@ func (p *WorkerPool) dispatchOne(ctx context.Context, taskID string) (string, st
 // executeTask runs a task on a worker and handles the result.
 func (p *WorkerPool) executeTask(ctx context.Context, w *Worker, task *QueueTask) {
 	timeout := p.config.TaskTimeout
-	if remaining := time.Until(task.FirstStartedAt.Add(p.config.RunPolicy.MaxTotalTime)); !task.FirstStartedAt.IsZero() && remaining < timeout {
-		timeout = remaining
-	}
+	// TaskTimeout is the budget for this execution slice. Total active time is
+	// accounted for by TaskQueue.finishAttempt and checked before the next
+	// claim; waiting between slices must never shorten a fresh slice.
 	taskCtx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
 	p.mu.Lock()
