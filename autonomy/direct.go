@@ -39,6 +39,10 @@ func (q *TaskQueue) CompactCompleted(keep int) error {
 	}
 	previous := q.tasks
 	q.tasks = next
+	if err := q.rewriteCheckpointEventsLocked(); err != nil {
+		q.tasks = previous
+		return err
+	}
 	if err := q.persistLocked(); err != nil {
 		q.tasks = previous
 		return err

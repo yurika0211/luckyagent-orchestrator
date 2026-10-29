@@ -82,6 +82,15 @@ Run these synthetic benchmarks with `go test ./autonomy -run '^$' -bench
 'BenchmarkQueue(SnapshotEncoding|PersistLock)' -benchtime=30x`. They are not
 production latency or task-quality measurements.
 
+Durable checkpoints use a version-compatible append log beside the queue file.
+Each checkpoint is gzip encoded and appended with the task attempt and sequence;
+the queue JSON retains a periodic snapshot (every 32 events) and older version-1
+files remain readable. Startup replays the log after loading the queue, while
+completed-task compaction rewrites the log so discarded evidence cannot return.
+The append log keeps the large message history out of the queue lock's repeated
+atomic writes; the latest checkpoint remains available after an interrupted
+write.
+
 ## Compatibility
 
 The tool SDK retains `autonomy`, `collab` and `task` forwarding packages with
