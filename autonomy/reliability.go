@@ -14,15 +14,16 @@ var ErrBlocked = errors.New("task requires intervention")
 var ErrStaleExecution = errors.New("task execution is no longer current")
 
 type RunPolicy struct {
-	MaxRetries   int
-	RetryInitial time.Duration
-	RetryMax     time.Duration
-	MaxSlices    int
-	MaxTotalTime time.Duration
+	MaxRetries    int
+	RetryInitial  time.Duration
+	RetryMax      time.Duration
+	MaxSlices     int
+	MaxTotalTime  time.Duration
+	LeaseDuration time.Duration
 }
 
 func DefaultRunPolicy() RunPolicy {
-	return RunPolicy{MaxRetries: 3, RetryInitial: 5 * time.Second, RetryMax: 5 * time.Minute, MaxSlices: 48, MaxTotalTime: 4 * time.Hour}
+	return RunPolicy{MaxRetries: 3, RetryInitial: 5 * time.Second, RetryMax: 5 * time.Minute, MaxSlices: 48, MaxTotalTime: 4 * time.Hour, LeaseDuration: 2 * time.Minute}
 }
 
 func normalizeRunPolicy(p RunPolicy) RunPolicy {
@@ -44,6 +45,9 @@ func normalizeRunPolicy(p RunPolicy) RunPolicy {
 	}
 	if p.MaxTotalTime <= 0 {
 		p.MaxTotalTime = d.MaxTotalTime
+	}
+	if p.LeaseDuration <= 0 {
+		p.LeaseDuration = d.LeaseDuration
 	}
 	return p
 }
@@ -110,6 +114,15 @@ func (e *Execution) SaveCheckpoint(data json.RawMessage) error {
 		t.CheckpointAt = time.Now()
 		return nil
 	})
+}
+
+// RenewLease keeps the queue claim alive while a long tool or model call is
+// running. The queue verifies the owner before extending the lease.
+func (e *Execution) RenewLease(owner string) error {
+	if e == nil || e.queue == nil {
+		return ErrStaleExecution
+	}
+	return e.queue.RenewLease(e.taskID, owner)
 }
 
 func (e *Execution) BeginOperation(op Operation) (Operation, error) {
@@ -227,7 +240,13 @@ func (q *TaskQueue) finishAttempt(t *QueueTask, result *WorkerResult, stopped bo
 		if current.State != TaskInProgress || current.Attempts != t.Attempts {
 			return ErrStaleExecution
 		}
+		if result != nil && result.Duration > 0 {
+			current.ExecutedNanos += result.Duration.Nanoseconds()
+		}
 		current.AssignedTo = ""
+		current.LeaseOwner = ""
+		current.LeaseExpiresAt = time.Time{}
+		current.LastHeartbeatAt = time.Time{}
 		current.Error = ""
 		if result.Error == nil {
 			if !result.Verified {
@@ -281,7 +300,7 @@ func (q *TaskQueue) budgetExceeded(t *QueueTask, now time.Time) string {
 	if t.Attempts-t.BudgetStartAttempt >= q.policy.MaxSlices {
 		return "task execution slice budget exhausted"
 	}
-	if !t.FirstStartedAt.IsZero() && now.Sub(t.FirstStartedAt) >= q.policy.MaxTotalTime {
+	if t.ExecutedNanos >= q.policy.MaxTotalTime.Nanoseconds() {
 		return "task total time budget exhausted"
 	}
 	return ""
