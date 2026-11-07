@@ -73,12 +73,18 @@ func (dm *DelegateManager) WithExecutionSlot(ctx context.Context, run func() (st
 type modeHandler struct {
 	dm             *DelegateManager
 	allowRecursive bool
+	disabledTools  []string
+	model          string
 }
 
 func (h modeHandler) HandleSubTask(ctx context.Context, sub *collab.SubTask) (string, error) {
 	ctx = context.WithValue(ctx, delegateTaskIDContextKey{}, sub.ID)
 	ctx = context.WithValue(ctx, delegateExecutionSessionIDContextKey{}, sub.ExecutionSessionID)
-	return h.dm.runChild(ctx, sub.Description, sub.Input, AgentExecutorOptions{AllowRecursiveDelegate: h.allowRecursive})
+	return h.dm.runChild(ctx, sub.Description, sub.Input, AgentExecutorOptions{
+		AllowRecursiveDelegate: h.allowRecursive,
+		DisabledTools:          append([]string(nil), h.disabledTools...),
+		Model:                  h.model,
+	})
 }
 
 func (h modeHandler) VerifySubTask(ctx context.Context, sub *collab.SubTask, output string) error {
@@ -119,7 +125,12 @@ func (dm *DelegateManager) executeMode(ctx context.Context, parent DelegateTask,
 			return "", err
 		}
 	}
-	manager := collab.NewDelegateManager(registry, modeHandler{dm: dm, allowRecursive: parent.AllowRecursiveDelegate})
+	manager := collab.NewDelegateManager(registry, modeHandler{
+		dm:             dm,
+		allowRecursive: parent.AllowRecursiveDelegate,
+		disabledTools:  append([]string(nil), parent.ChildDisabledTools...),
+		model:          parent.ChildModel,
+	})
 	manager.SetTaskPlanner(planner)
 	// This transient manager writes its own new task tree, without reconciling
 	// other active collaboration runs in the same application store.

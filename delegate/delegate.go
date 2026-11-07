@@ -51,6 +51,7 @@ type DelegateConfig struct {
 	ChildToolOnlyLimit   int           // 子 Agent 连续纯工具轮次上限
 	ChildDuplicateLimit  int           // 子 Agent 同 URL 抓取上限
 	ChildDisabledTools   []string      // 子 Agent 默认隐藏的工具
+	ChildModel           string        // 子 Agent 模型；空表示用当前默认模型
 	ChildAllowRecursive  bool          // 是否允许子 Agent 再次创建子 Agent
 }
 
@@ -303,6 +304,14 @@ type DelegateTask struct {
 	RequestKey             string
 	AllowRecursiveDelegate bool
 	MaxChildren            int
+	// ResumedFrom is the terminal task whose child execution session this run
+	// continues. Empty for a fresh delegate.
+	ResumedFrom string
+	// ChildDisabledTools and ChildModel are the tool set and model captured
+	// when the task was created. A resume copies them so the continuation
+	// does not pick up a later config change.
+	ChildDisabledTools []string
+	ChildModel         string
 }
 
 // Owner identifies a parent session and its idempotent delegation request.
@@ -329,6 +338,7 @@ type StartResponse struct {
 	TraceAvailable     bool   `json:"trace_available,omitempty"`
 	Workspace          string `json:"workspace"`
 	TimeoutSeconds     int    `json:"timeout_seconds"`
+	ResumedFrom        string `json:"resumed_from,omitempty"`
 	Message            string `json:"message"`
 }
 
@@ -412,6 +422,11 @@ type AgentExecutorFunc func(ctx context.Context, description, contextStr string)
 // changing the original AgentExecutorFunc signature.
 type AgentExecutorOptions struct {
 	AllowRecursiveDelegate bool
+	// DisabledTools and Model are the tool set and model captured for this
+	// task. A resume copies the original task's values. An empty Model means
+	// the host should use its current default child model.
+	DisabledTools []string
+	Model         string
 }
 
 // AgentExecutorWithOptionsFunc executes a delegated child with effective
@@ -878,7 +893,9 @@ func cloneDelegateTask(task *DelegateTask) DelegateTask {
 	if task == nil {
 		return DelegateTask{}
 	}
-	return *task
+	cloned := *task
+	cloned.ChildDisabledTools = append([]string(nil), task.ChildDisabledTools...)
+	return cloned
 }
 
 func delegateElapsedMillis(start, end time.Time) int64 {
@@ -1034,13 +1051,21 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 	dm.mu.RUnlock()
 	mode, plannedMode, plannerSummary, plannerTrace := planDelegateTaskMode(description, contextStr, requestedMode, timeout, maxChildren, planner)
 	allowRecursive := delegateBoolArg(args, "allow_recursive_delegate", false) && delegateCfg.ChildAllowRecursive
+	resumeFrom := ""
+	if raw, ok := args["resume_from"]; ok && raw != nil {
+		text, isString := raw.(string)
+		if !isString {
+			return "", fmt.Errorf("resume_from must be a task id")
+		}
+		resumeFrom = strings.TrimSpace(text)
+	}
 
 	// Reuse an existing task when the same request is dispatched more than
 	// once. This makes retries from a streaming provider idempotent.
 	dm.mu.Lock()
 	running := 0
 	for _, t := range dm.tasks {
-		if owner.scoped() && owner.RequestKey != "" && t.OwnerSessionID == owner.SessionID && t.RequestKey == owner.RequestKey {
+		if owner.scoped() && owner.RequestKey != "" && t.OwnerSessionID == owner.SessionID && t.RequestKey == owner.RequestKey && t.ResumedFrom == resumeFrom {
 			response, _ := json.Marshal(StartResponse{
 				TaskID:             t.ID,
 				ExecutionSessionID: t.ExecutionSessionID,
@@ -1052,6 +1077,7 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 				PlannerSummary:     t.PlannerSummary,
 				Workspace:          t.Workspace,
 				TimeoutSeconds:     int(timeout.Seconds()),
+				ResumedFrom:        t.ResumedFrom,
 				Message:            fmt.Sprintf("Task '%s' already exists for this request.", t.ID),
 			})
 			dm.mu.Unlock()
@@ -1066,16 +1092,55 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 		return "", fmt.Errorf("max concurrent tasks reached (%d)", dm.config.MaxConcurrent)
 	}
 
+	var resumed *DelegateTask
+	if resumeFrom != "" {
+		source, err := dm.terminalResumeSourceLocked(resumeFrom, owner)
+		if err != nil {
+			dm.mu.Unlock()
+			return "", err
+		}
+		resumed = source
+		// Continue the finished child. Do not replan it into a multi-agent mode.
+		mode = source.Mode
+		if mode == "" {
+			mode = taskstore.ModeSingle
+		}
+		plannedMode = source.PlannedMode
+		plannerSummary = source.PlannerSummary
+		plannerTrace = nil
+		allowRecursive = source.AllowRecursiveDelegate
+		maxChildren = source.MaxChildren
+	}
+	childDisabled := append([]string(nil), delegateCfg.ChildDisabledTools...)
+	childModel := strings.TrimSpace(delegateCfg.ChildModel)
+	if resumed != nil {
+		childDisabled = append([]string(nil), resumed.ChildDisabledTools...)
+		childModel = resumed.ChildModel
+	}
+
 	// 创建任务
 	dm.nextID++
 	// Keep task IDs unique across runtime restarts; the counter alone would
 	// recreate task-1 and could reuse its persisted execution session.
 	taskID := fmt.Sprintf("task-%d-%d", time.Now().UnixNano(), dm.nextID)
 	executionSessionID := delegateExecutionSessionID(taskID)
-	workspace, enrichedContext, err := prepareDelegateExecutionContext(taskID, description, contextStr, dm.workspacePolicy)
-	if err != nil {
-		dm.mu.Unlock()
-		return "", err
+	role := "subagent"
+	workspace := ""
+	enrichedContext := contextStr
+	if resumed != nil {
+		executionSessionID = resumed.ExecutionSessionID
+		role = resumed.Role
+		workspace = resumed.Workspace
+		if workspace == "" {
+			workspace = defaultDelegateWorkspace(resumed.ID)
+		}
+	} else {
+		var err error
+		workspace, enrichedContext, err = prepareDelegateExecutionContext(taskID, description, contextStr, dm.workspacePolicy)
+		if err != nil {
+			dm.mu.Unlock()
+			return "", err
+		}
 	}
 	task := &DelegateTask{
 		ID:                     taskID,
@@ -1090,18 +1155,23 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 		OwnerSessionID:         owner.SessionID,
 		ExecutionSessionID:     executionSessionID,
 		ParentSessionID:        owner.SessionID,
-		Role:                   "subagent",
+		Role:                   role,
 		OwnerSource:            owner.Source,
 		RequestKey:             owner.RequestKey,
 		AllowRecursiveDelegate: allowRecursive,
 		MaxChildren:            maxChildren,
+		ResumedFrom:            resumeFrom,
+		ChildDisabledTools:     childDisabled,
+		ChildModel:             childModel,
 	}
 	dm.tasks[taskID] = task
 	store := dm.taskStore
 	events := dm.taskEvents
 	initializeSession := dm.sessionInitializer
 	dm.mu.Unlock()
-	if initializeSession != nil {
+	// A resume keeps the finished child's messages. Initializing that session
+	// again would replace the tool transcript the continuation needs.
+	if initializeSession != nil && resumed == nil {
 		snapshot := cloneDelegateTask(task)
 		if err := initializeSession(&snapshot); err != nil {
 			dm.mu.Lock()
@@ -1120,7 +1190,7 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 		TaskID:             taskID,
 		ExecutionSessionID: executionSessionID,
 		ParentSessionID:    owner.SessionID,
-		Role:               "subagent",
+		Role:               role,
 		Status:             StatusRunning.String(),
 		Mode:               string(mode),
 		PlannedMode:        string(plannedMode),
@@ -1128,10 +1198,34 @@ func (dm *DelegateManager) HandleDelegateWithOwner(args map[string]any, owner Ow
 		TraceAvailable:     plannerTrace != nil,
 		Workspace:          workspace,
 		TimeoutSeconds:     int(timeout.Seconds()),
+		ResumedFrom:        resumeFrom,
 		Message:            fmt.Sprintf("Task '%s' delegated. Use wait_for_tasks with this task ID before synthesizing a final answer.", taskID),
 	})
 
 	return string(result), nil
+}
+
+// terminalResumeSourceLocked checks resume_from while dm.mu is held.
+// A rejected resume must not create a task. The returned task is the original
+// and must not be mutated.
+func (dm *DelegateManager) terminalResumeSourceLocked(taskID string, owner Owner) (*DelegateTask, error) {
+	taskID = strings.TrimSpace(taskID)
+	task := dm.tasks[taskID]
+	if task == nil {
+		return nil, fmt.Errorf("resume_from task not found: %s", taskID)
+	}
+	if owner.scoped() && strings.TrimSpace(task.OwnerSessionID) != owner.SessionID {
+		return nil, fmt.Errorf("resume_from task is not available in the current session")
+	}
+	switch task.Status {
+	case StatusCompleted, StatusFailed, StatusCancelled:
+	default:
+		return nil, fmt.Errorf("resume_from task %s is %s; only completed, failed, or cancelled tasks can resume", taskID, task.Status.String())
+	}
+	if strings.TrimSpace(task.ExecutionSessionID) == "" {
+		return nil, fmt.Errorf("resume_from task %s has no execution session", taskID)
+	}
+	return task, nil
 }
 
 // executeTask 执行子代理任务
@@ -1145,6 +1239,9 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 	}
 	if strings.TrimSpace(task.ExecutionSessionID) == "" {
 		task.ExecutionSessionID = delegateExecutionSessionID(taskID)
+	}
+	if strings.TrimSpace(task.Role) == "" {
+		task.Role = "subagent"
 	}
 	task.Status = StatusRunning
 	baseCtx := context.WithValue(context.Background(), delegateTaskIDContextKey{}, taskID)
@@ -1173,7 +1270,11 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 		if executionTask.Mode != "" && executionTask.Mode != taskstore.ModeSingle {
 			result, err = dm.executeMode(ctx, executionTask, description, contextStr, timeout)
 		} else {
-			result, err = dm.runChild(ctx, description, contextStr, AgentExecutorOptions{AllowRecursiveDelegate: allowRecursive})
+			result, err = dm.runChild(ctx, description, contextStr, AgentExecutorOptions{
+				AllowRecursiveDelegate: allowRecursive,
+				DisabledTools:          append([]string(nil), executionTask.ChildDisabledTools...),
+				Model:                  executionTask.ChildModel,
+			})
 		}
 		if err == nil && ctx.Err() != nil {
 			err = ctx.Err()
@@ -1842,6 +1943,10 @@ func (dm *DelegateManager) recordDelegateTaskCreated(store taskstore.Store, even
 			"execution_session_id": task.ExecutionSessionID,
 			"parent_session_id":    task.ParentSessionID,
 			"role":                 task.Role,
+			"resumed_from":         task.ResumedFrom,
+			"allow_recursive":      fmt.Sprintf("%t", task.AllowRecursiveDelegate),
+			"child_disabled_tools": strings.Join(task.ChildDisabledTools, ","),
+			"child_model":          task.ChildModel,
 		},
 	}
 	if _, err := store.Create(record); err != nil {
