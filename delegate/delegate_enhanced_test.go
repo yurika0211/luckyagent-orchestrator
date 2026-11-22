@@ -177,6 +177,25 @@ func TestDelegateToMCPWithoutExecutorFails(t *testing.T) {
 	t.Fatal("unconfigured MCP delegation did not fail")
 }
 
+func TestDelegateTimeoutWithResultBecomesPartial(t *testing.T) {
+	dm := NewDelegateManager(DefaultDelegateConfig())
+	dm.SetAgentExecutor(func(ctx context.Context, _, _ string) (string, error) {
+		<-ctx.Done()
+		return "work completed before the deadline", ctx.Err()
+	})
+	task := &DelegateTask{ID: "partial-timeout", Status: StatusPending, Description: "bounded work"}
+	dm.mu.Lock()
+	dm.tasks[task.ID] = task
+	dm.mu.Unlock()
+	dm.executeTask(task.ID, task.Description, "", 10*time.Millisecond)
+	dm.mu.RLock()
+	snapshot := cloneDelegateTask(dm.tasks[task.ID])
+	dm.mu.RUnlock()
+	if snapshot.Status != StatusPartial || snapshot.Result == "" || snapshot.Error == "" {
+		t.Fatalf("expected partial result after timeout, got status=%s result=%q error=%q", snapshot.Status, snapshot.Result, snapshot.Error)
+	}
+}
+
 func TestPriorityTaskQueue(t *testing.T) {
 	q := NewPriorityTaskQueue()
 

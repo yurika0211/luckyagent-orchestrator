@@ -70,6 +70,8 @@ func ReduceObservation(record Record, events []Event) MainAgentObservation {
 				state = StatusRunning
 			case EventCompleted:
 				state = StatusCompleted
+			case EventPartial:
+				state = StatusPartial
 			case EventFailed:
 				state = StatusFailed
 			case EventCancelled:
@@ -100,7 +102,7 @@ func ReduceObservation(record Record, events []Event) MainAgentObservation {
 		switch state {
 		case StatusPending, StatusRunning:
 			obs.RunningChildren++
-		case StatusCompleted:
+		case StatusCompleted, StatusPartial:
 			obs.CompletedChildren++
 			terminalChildren++
 		case StatusFailed, StatusBlocked:
@@ -138,7 +140,7 @@ func ReduceObservation(record Record, events []Event) MainAgentObservation {
 
 func progressForStatus(status Status) float64 {
 	switch status {
-	case StatusCompleted, StatusCancelled:
+	case StatusCompleted, StatusPartial, StatusCancelled:
 		return 1
 	case StatusRunning:
 		return 0.5

@@ -3,6 +3,7 @@ package delegate
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -256,6 +257,7 @@ const (
 	StatusPending TaskStatus = iota
 	StatusRunning
 	StatusCompleted
+	StatusPartial
 	StatusFailed
 	StatusCancelled
 )
@@ -268,6 +270,8 @@ func (s TaskStatus) String() string {
 		return "running"
 	case StatusCompleted:
 		return "completed"
+	case StatusPartial:
+		return "partial"
 	case StatusFailed:
 		return "failed"
 	case StatusCancelled:
@@ -670,7 +674,7 @@ func (dm *DelegateManager) RetryTask(taskID string) (string, error) {
 	if task == nil {
 		return "", fmt.Errorf("task not found: %s", taskID)
 	}
-	if task.Status != StatusFailed && task.Status != StatusCancelled {
+	if task.Status != StatusFailed && task.Status != StatusPartial && task.Status != StatusCancelled {
 		return "", fmt.Errorf("task %s is not retryable from status %s", taskID, task.Status.String())
 	}
 	return dm.HandleDelegate(map[string]any{"description": task.Description, "context": task.Context})
@@ -882,7 +886,7 @@ func taskModeFromCollab(mode collab.CollabMode) taskstore.Mode {
 
 func isValidDelegateStatus(status string) bool {
 	switch status {
-	case StatusPending.String(), StatusRunning.String(), StatusCompleted.String(), StatusFailed.String(), StatusCancelled.String():
+	case StatusPending.String(), StatusRunning.String(), StatusCompleted.String(), StatusPartial.String(), StatusFailed.String(), StatusCancelled.String():
 		return true
 	default:
 		return false
@@ -945,7 +949,7 @@ func formatDelegateCompletedAt(t time.Time) string {
 
 func isTerminalDelegateStatus(status string) bool {
 	switch strings.ToLower(strings.TrimSpace(status)) {
-	case StatusCompleted.String(), StatusFailed.String(), StatusCancelled.String():
+	case StatusCompleted.String(), StatusPartial.String(), StatusFailed.String(), StatusCancelled.String():
 		return true
 	default:
 		return false
@@ -1218,7 +1222,7 @@ func (dm *DelegateManager) terminalResumeSourceLocked(taskID string, owner Owner
 		return nil, fmt.Errorf("resume_from task is not available in the current session")
 	}
 	switch task.Status {
-	case StatusCompleted, StatusFailed, StatusCancelled:
+	case StatusCompleted, StatusPartial, StatusFailed, StatusCancelled:
 	default:
 		return nil, fmt.Errorf("resume_from task %s is %s; only completed, failed, or cancelled tasks can resume", taskID, task.Status.String())
 	}
@@ -1286,7 +1290,13 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 		if task.Status == StatusCancelled {
 			// Cancellation was requested through delegate_cancel; preserve it.
 		} else if err != nil {
-			task.Status = StatusFailed
+			if strings.TrimSpace(result) != "" {
+				task.Status = StatusPartial
+			} else if errors.Is(ctx.Err(), context.DeadlineExceeded) && task.ToolCalls == 0 {
+				task.Status = StatusCancelled
+			} else {
+				task.Status = StatusFailed
+			}
 			task.Error = err.Error()
 			task.Result = result
 		} else {
@@ -1307,7 +1317,11 @@ func (dm *DelegateManager) executeTask(taskID, description, contextStr string, t
 	case <-ctx.Done():
 		dm.mu.Lock()
 		if task.Status != StatusCancelled {
-			task.Status = StatusFailed
+			if errors.Is(ctx.Err(), context.DeadlineExceeded) {
+				task.Status = StatusCancelled
+			} else {
+				task.Status = StatusFailed
+			}
 			task.Error = "timeout"
 			task.CompletedAt = time.Now()
 		}
@@ -1696,6 +1710,7 @@ func (dm *DelegateManager) HandleListForSession(args map[string]any, sessionID s
 		StatusPending.String():   0,
 		StatusRunning.String():   0,
 		StatusCompleted.String(): 0,
+		StatusPartial.String():   0,
 		StatusFailed.String():    0,
 		StatusCancelled.String(): 0,
 	}
@@ -1884,7 +1899,7 @@ func (dm *DelegateManager) CancelTask(taskID, reason string) error {
 		return fmt.Errorf("task not found: %s", taskID)
 	}
 	switch task.Status {
-	case StatusCompleted, StatusFailed, StatusCancelled:
+	case StatusCompleted, StatusPartial, StatusFailed, StatusCancelled:
 		status := task.Status.String()
 		dm.mu.Unlock()
 		return fmt.Errorf("task %s cannot be cancelled from status %s", taskID, status)
@@ -2014,6 +2029,9 @@ func (dm *DelegateManager) recordDelegateTaskFinished(store taskstore.Store, eve
 	case StatusCompleted:
 		_ = store.SaveResult(task.ID, task.Result)
 		_ = events.Completed(record, "delegate task completed")
+	case StatusPartial:
+		_ = store.SaveResult(task.ID, task.Result)
+		_ = events.Partial(record, "delegate task timed out with a partial result")
 	case StatusFailed:
 		_ = events.Failed(record, task.Error)
 	case StatusCancelled:
@@ -2044,6 +2062,8 @@ func delegateStatusToUnified(status TaskStatus) taskstore.Status {
 		return taskstore.StatusRunning
 	case StatusCompleted:
 		return taskstore.StatusCompleted
+	case StatusPartial:
+		return taskstore.StatusPartial
 	case StatusFailed:
 		return taskstore.StatusFailed
 	case StatusCancelled:

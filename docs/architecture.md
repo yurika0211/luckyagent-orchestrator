@@ -49,6 +49,14 @@ partial results; retries include prior feedback. Ballots preserve positions,
 reject unknown agents and require a strict majority. Aggregation preserves
 unscored candidates and never infers consensus from a shared text prefix.
 
+Direct delegate tasks have one task budget and cancellation boundary. The
+legacy `delegate.child.timeout_seconds` value remains readable for config
+compatibility but is not applied as a second whole-loop deadline. If a child
+deadline expires after producing usable text, the task is stored as `partial`
+with its result and timeout error; an empty deadline result with no tool calls
+is stored as `cancelled`. `partial` is terminal and remains visible to status,
+wait, persistence, and result consumers.
+
 ## Durable state and foreground use
 
 - `task.Record` and its artifacts retain their existing JSON fields and files.

@@ -479,6 +479,7 @@ func TestTaskStatusString(t *testing.T) {
 		{StatusPending, "pending"},
 		{StatusRunning, "running"},
 		{StatusCompleted, "completed"},
+		{StatusPartial, "partial"},
 		{StatusFailed, "failed"},
 		{StatusCancelled, "cancelled"},
 	}
