@@ -18,7 +18,7 @@ func TestDelegateManagerCreate(t *testing.T) {
 	if dm.config.MaxConcurrent != 3 {
 		t.Errorf("expected max 3, got %d", dm.config.MaxConcurrent)
 	}
-	if dm.config.MaxChildren != 3 || dm.config.ChildMaxIterations != 5 || dm.config.ChildTimeout != 60*time.Second {
+	if dm.config.MaxChildren != 3 || dm.config.ChildMaxIterations != 5 || dm.config.ChildTimeout != 120*time.Second {
 		t.Errorf("unexpected child defaults: max_children=%d max_iterations=%d timeout=%s", dm.config.MaxChildren, dm.config.ChildMaxIterations, dm.config.ChildTimeout)
 	}
 }
