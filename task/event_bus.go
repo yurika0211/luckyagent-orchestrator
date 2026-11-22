@@ -100,6 +100,21 @@ func (b *EventBus) Completed(record Record, message string) error {
 	})
 }
 
+func (b *EventBus) Partial(record Record, message string) error {
+	return b.Emit(Event{
+		Type:               EventPartial,
+		TaskID:             record.ID,
+		ParentID:           record.ParentID,
+		ExecutionSessionID: record.ExecutionSessionID,
+		ParentSessionID:    record.ParentSessionID,
+		Role:               record.Role,
+		Status:             StatusPartial,
+		Mode:               record.Mode,
+		Message:            message,
+		Metadata:           eventMetadata(record),
+	})
+}
+
 func (b *EventBus) Failed(record Record, errText string) error {
 	return b.Emit(Event{
 		Type:               EventFailed,

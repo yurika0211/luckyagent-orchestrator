@@ -286,7 +286,7 @@ func (s *FileStore) Cleanup(policy RetentionPolicy) (CleanupResult, error) {
 	}
 	statuses := policy.Statuses
 	if len(statuses) == 0 {
-		statuses = []Status{StatusCompleted, StatusFailed, StatusCancelled}
+		statuses = []Status{StatusCompleted, StatusPartial, StatusFailed, StatusCancelled}
 	}
 	statusSet := make(map[Status]struct{}, len(statuses))
 	for _, status := range statuses {
