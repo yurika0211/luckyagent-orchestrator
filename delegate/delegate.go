@@ -67,7 +67,9 @@ func DefaultDelegateConfig() DelegateConfig {
 		MaxChildren:          3,
 		AutoApprove:          false,
 		ChildMaxIterations:   5,
-		ChildTimeout:         60 * time.Second,
+		// Kept for config compatibility; consumers must use the task Timeout
+		// as the single whole-loop deadline.
+		ChildTimeout:         120 * time.Second,
 		ChildAutoApprove:     false,
 		ChildRepeatToolLimit: 3,
 		ChildToolOnlyLimit:   3,
@@ -108,7 +110,7 @@ func normalizeDelegateConfig(cfg DelegateConfig) DelegateConfig {
 		cfg.ChildMaxIterations = 5
 	}
 	if cfg.ChildTimeout <= 0 {
-		cfg.ChildTimeout = 60 * time.Second
+		cfg.ChildTimeout = cfg.Timeout
 	}
 	if cfg.ChildRepeatToolLimit <= 0 {
 		cfg.ChildRepeatToolLimit = 3
